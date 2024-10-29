@@ -1,7 +1,11 @@
 # Manage Notepad Windows
 
 ## Description
-Manage Notepad Windows is a Windows application designed to track and manage open Notepad instances. It helps users keep important pieces of information easily accessible, preventing data loss from unsaved Notepad windows. With this tool, users can:
+Manage Notepad Windows is a Windows application designed to track and manage open Notepad instances. It helps users keep important pieces of information easily accessible, preventing data loss from unsaved Notepad windows. 
+
+![Application Screenshot](assets/screenshot.png)
+
+With this tool, users can:
 - Preview open Notepad windows.
 - Restore unsaved notes after a system reboot.
 - Efficiently manage multiple open Notepad instances without losing track.
