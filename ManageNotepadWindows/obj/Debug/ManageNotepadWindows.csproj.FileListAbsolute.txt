@@ -1,0 +1,11 @@
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Debug\ManageNotepadWindows.exe.config
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Debug\ManageNotepadWindows.csprojResolveAssemblyReference.cache
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Debug\ManageNotepadWindows.Properties.Resources.resources
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Debug\ManageNotepadWindows.csproj.GenerateResource.Cache
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Debug\ManageNotepadWindows.exe
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Debug\ManageNotepadWindows.pdb
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Debug\ManageNotepadWindows.NotepadsManager.resources
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Debug\ManageNotepadWindows.exe
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Debug\ManageNotepadWindows.pdb
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Debug\MaterialSkin.dll
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Debug\notepad_manager_icon.ico

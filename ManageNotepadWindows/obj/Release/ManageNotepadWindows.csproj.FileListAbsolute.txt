@@ -1,0 +1,15 @@
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Release\notepad_manager_icon.ico
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Release\ManageNotepadWindows.exe.config
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Release\ManageNotepadWindows.exe
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Release\ManageNotepadWindows.pdb
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Release\MaterialSkin.dll
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.NotepadsManager.resources
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.Properties.Resources.resources
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.csproj.GenerateResource.Cache
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.exe
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.pdb
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Release\ManageNotepadWindows.exe.manifest
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\bin\Release\ManageNotepadWindows.application
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.exe.manifest
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.application
+D:\VS\Projects\ManageNotepadWindows\ManageNotepadWindows\obj\Release\ManageNotepadWindows.csprojResolveAssemblyReference.cache
