@@ -1,7 +1,7 @@
 # Manage Notepad Windows
 
 ## Description
-Manage Notepad Windows is a Windows application designed to track and manage open Notepad instances. It helps users keep important pieces of information easily accessible, preventing data loss from unsaved Notepad windows. 
+Manage Notepad Windows is a Windows application designed to track and manage open Notepad instances. It helps users keep important pieces of information easily accessible, preventing data loss from unsaved Notepad windows.
 
 ![Application Screenshot](assets/screenshot.png)
 
@@ -33,6 +33,25 @@ With this tool, users can:
    ```
 3. Build the application using Visual Studio.
 4. Run the executable from the build output directory.
+
+## Download
+You can download the application here: [Download Manage Notepad Windows](assets/ManageNotepadWindows.zip)
+
+## Checksum
+**Checksum**: CRC32: `3663291608`
+
+### Instructions to Verify:
+1. After downloading, unzip the file and run the following command to compute the checksum:
+   ```bash
+   cksum ManageNotepadWindows.exe
+   ```
+2. Compare the output to the checksum provided above. If they match, the file is genuine and unaltered.
+
+## Digital Signature
+For security, the executable file is digitally signed. Users can verify the digital signature by:
+1. Right-clicking on the downloaded executable file.
+2. Selecting "Properties."
+3. Going to the "Digital Signatures" tab to view the signature details.
 
 ## Usage
 1. Launch the application.
