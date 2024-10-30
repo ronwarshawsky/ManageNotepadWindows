@@ -35,7 +35,7 @@ With this tool, users can:
 4. Run the executable from the build output directory.
 
 ## Download
-You can download the application here: [Download Manage Notepad Windows](ManageNotepadWindows/raw/refs/heads/main/assets/ManageNotepadWindows.zip)
+You can download the application here: [Download Manage Notepad Windows](https://github.com/ronwarshawsky/ManageNotepadWindows/raw/refs/heads/main/assets/ManageNotepadWindows.zip)
 
 ## Checksum
 **Checksum**: CRC32: `3663291608`
