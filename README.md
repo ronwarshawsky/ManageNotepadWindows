@@ -12,7 +12,8 @@ With this tool, users can:
 
 ## Features
 - List all open Notepad instances.
-- Double-click to preview and reopen notes.
+- Click on any entry to review Notepad content.
+- Double-click to open a note.
 - Automatic restoration of unsaved notes after application start.
 - User-friendly interface for both technical and non-technical users.
 
