@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(msbuild:*)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\" ManageNotepadWindows.sln /p:Configuration=Release /v:minimal)",
+      "Bash(ls:*)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\" ManageNotepadWindows.csproj /p:Configuration=Release)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\" ManageNotepadWindows.csproj //p:Configuration=Release)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe\" ManageNotepadWindows.csproj //p:Configuration=Release //t:Rebuild)",
+      "Bash(taskkill:*)",
+      "Bash(start ./ManageNotepadWindows.exe)",
+      "Bash(nuget update:*)",
+      "Bash(powershell -Command \"Get-Content ManageNotepadWindows.exe.manifest\")",
+      "Bash(cmd.exe //c \"taskkill /F /IM ManageNotepadWindows.exe\")"
+    ]
+  }
+}

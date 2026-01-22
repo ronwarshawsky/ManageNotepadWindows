@@ -1,6 +1,5 @@
 ﻿using System;
 using System.IO;
-using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -8,730 +7,707 @@ using System.Text;
 using System.Linq;
 using System.Drawing;
 using System.Windows.Forms;
-//
+using System.Windows.Automation;
 using MaterialSkin;
 using MaterialSkin.Controls;
-//
 using Microsoft.Win32;
 
 namespace ManageNotepadWindows
 {
     public partial class NotepadsManager : MaterialForm
     {
-        private int sortColumn = -1;
-        private string backupDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "NotepadBackups");
+        // UI font sizing constraints and step
+        private const float MinFontSize = 9F;
+        private const float MaxFontSize = 20F;
+        private const float FontStep = 1F;
+
+        private float currentFontSize = 11F;
+
+        // Sorting state for DataGridView (virtual mode)
+        private int sortColumnIndex = -1;
+        private bool sortAscending = true;
+
+        private readonly string backupDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "NotepadBackups");
+        private Timer searchDebounceTimer;
+
+        // Virtualized grid + model
+        private DataGridView gridNotepadWindows;
+        private List<NotepadWindowInfo> notepadWindows = new List<NotepadWindowInfo>();
+
+        // Preview and UI
+        private RichTextBox textBoxNotepadContent;
+        private Panel panelTop;
+        private Button refresh;
+        private MaterialTextBox2 textBoxSearch;
+        private SplitContainer splitContainer1;
+        private Button btnFontIncrease;
+        private Button btnFontDecrease;
+
+        // Native helpers (consolidated)
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, StringBuilder lParam);
+        [DllImport("user32.dll", EntryPoint = "SendMessage", CharSet = CharSet.Auto)]
+        private static extern IntPtr SendMessageInt(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr childAfter, string className, string windowTitle);
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+        [DllImport("user32.dll")]
+        private static extern bool EnumChildWindows(IntPtr hWndParent, EnumChildProc lpEnumFunc, IntPtr lParam);
+        private delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+
+        // Title dragging constants
+        private const int WM_NCLBUTTONDOWN = 0x00A1;
+        private const int HTCAPTION = 2;
+
+        // Other constants
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint TOPMOST_FLAGS = SWP_NOMOVE | SWP_NOSIZE;
+        private const uint WM_GETTEXT = 0x000D;
+        private const uint WM_GETTEXTLENGTH = 0x000E;
+        private const uint WM_CHAR = 0x0102;
+        private const uint WM_SETTEXT = 0x000C;
+        private const int SW_RESTORE = 9;
+
+        // Model
+        private class NotepadWindowInfo
+        {
+            public IntPtr Hwnd;
+            public int ProcessId;
+            public string Title;
+            public string Preview;
+            public string Diagnostic;
+        }
 
         public NotepadsManager()
         {
             InitializeComponent();
 
-            // Set up ListView columns programmatically
-            SetupListViewColumns();
-            MakeWindowTopMost();
+            // DPI autoscale
+            this.AutoScaleMode = AutoScaleMode.Dpi;
 
-            // Initialize MaterialSkinManager
+            // MaterialSkin setup
             var materialSkinManager = MaterialSkinManager.Instance;
             materialSkinManager.AddFormToManage(this);
-
-            // You can choose between Themes: LIGHT or DARK
             materialSkinManager.Theme = MaterialSkinManager.Themes.LIGHT;
+            materialSkinManager.ColorScheme = new ColorScheme(Primary.Blue500, Primary.Blue700, Primary.Blue200, Accent.LightBlue200, TextShade.WHITE);
 
-            // Customize the color scheme of the material form
-            materialSkinManager.ColorScheme = new ColorScheme(
-                Primary.Blue500, Primary.Blue700,
-                Primary.Blue200, Accent.LightBlue200,
-                TextShade.WHITE
-            );
-
-            // Ensure backup directory exists
-            if (!Directory.Exists(backupDir))
-            {
-                Directory.CreateDirectory(backupDir);
-            }
-
-            // Restore backup files on startup
+            // Ensure backup dir + restore
+            if (!Directory.Exists(backupDir)) Directory.CreateDirectory(backupDir);
             RestoreBackupNotepadContent();
 
-            // Start the backup timer (every 5 minutes)
-            Timer backupTimer = new Timer();
-            backupTimer.Interval = 5 * 60 * 1000; // 5 minutes
+            // Timers
+            Timer backupTimer = new Timer { Interval = 5 * 60 * 1000 };
             backupTimer.Tick += (s, e) => BackupUnsavedNotepadContent();
             backupTimer.Start();
 
-            // Hook into the system shutdown/logoff event
-            SystemEvents.SessionEnding += new SessionEndingEventHandler(OnSessionEnding);
+            searchDebounceTimer = new Timer { Interval = 300 };
+            searchDebounceTimer.Tick += SearchDebounceTimer_Tick;
 
-        } //EOC
+            // Behavior
+            SetupGrid();
+            MakeWindowTopMost();
+            this.Load += NotepadsManager_Load;
 
+            // keyboard shortcuts
+            this.KeyPreview = true;
+            this.KeyDown += NotepadsManager_KeyDown;
+        }
+
+        private void NotepadsManager_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Control && e.KeyCode == Keys.F) { textBoxSearch.Focus(); e.Handled = true; }
+            if (e.Control && e.KeyCode == Keys.Oemplus) { btnFontIncrease_Click(this, EventArgs.Empty); e.Handled = true; }
+            if (e.Control && e.KeyCode == Keys.OemMinus) { btnFontDecrease_Click(this, EventArgs.Empty); e.Handled = true; }
+        }
 
         private void MakeWindowTopMost()
         {
-            // Set the window as top-most
             SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0, TOPMOST_FLAGS);
         }
 
-        // Importing Windows API functions to interact with windows
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool IsWindowVisible(IntPtr hWnd);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, StringBuilder lParam);
-
-        [DllImport("user32.dll", CharSet = CharSet.Auto)]
-        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr childAfter, string className, string windowTitle);
-
-        [DllImport("user32.dll")]
-        private static extern bool SetForegroundWindow(IntPtr hWnd);
-
-        [DllImport("user32.dll")]
-        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-        // Import the SetWindowPos function from the Windows API
-        [DllImport("user32.dll")]
-        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-        private const uint SWP_NOMOVE = 0x0002;
-        private const uint SWP_NOSIZE = 0x0001;
-        private const uint TOPMOST_FLAGS = SWP_NOMOVE | SWP_NOSIZE;
-
-
-
-        // Constants for Windows API messages
-        const uint WM_GETTEXT = 0x000D;
-        const uint WM_GETTEXTLENGTH = 0x000E;
-        const uint WM_CHAR = 0x0102;
-        const uint WM_SETTEXT = 0x000C; // Define WM_SETTEXT
-
-        private const int SW_RESTORE = 9;  // Restores a minimized window to its original size
-        //
-        private ListView listViewNotepadWindows;
-        //private TextBox textBoxNotepadContent;
-        private RichTextBox textBoxNotepadContent;
-        private Panel panelTop;
-        private Button refresh;
-        //private TextBox textBoxSearch;
-        private MaterialTextBox2 textBoxSearch;
-        private PictureBox clearSearchButton;
-        //
-        private SplitContainer splitContainer1;
-
-        // Event handler for Refresh button click
-        private void btnRefresh_Click(object sender, EventArgs e)
+        private void SetupGrid()
         {
-            PopulateNotepadWindows();
-        }
-
-        // Function to populate the Notepad windows in the ListView
-        private void PopulateNotepadWindows()
-        {
-            // Clear the existing list before updating
-            listViewNotepadWindows.Items.Clear();
-
-            // Get all running Notepad processes
-            Process[] processes = Process.GetProcessesByName("notepad");
-
-            // Iterate over each Notepad process
-            foreach (Process process in processes)
+            if (gridNotepadWindows == null)
             {
-                IntPtr hWnd = process.MainWindowHandle;
-
-                if (hWnd != IntPtr.Zero && IsWindowVisible(hWnd))
+                gridNotepadWindows = new DataGridView
                 {
-                    // Retrieve the window title
-                    StringBuilder windowTitle = new StringBuilder(256);
-                    GetWindowText(hWnd, windowTitle, windowTitle.Capacity);
+                    Dock = DockStyle.Fill,
+                    ReadOnly = true,
+                    AllowUserToAddRows = false,
+                    AllowUserToDeleteRows = false,
+                    SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                    VirtualMode = true,
+                    RowHeadersVisible = false,
+                    AllowUserToResizeRows = false,
+                    AllowUserToOrderColumns = true,
+                    AutoGenerateColumns = false,
+                    MultiSelect = false
+                };
 
-                    // Get the actual text content from the Notepad child window (limited to the first two lines)
-                    string windowContent = GetNotepadText(hWnd, 2); // Limit to 2 lines
+                var colPid = new DataGridViewTextBoxColumn { Name = "ProcessId", HeaderText = "PID", Width = 90 };
+                var colName = new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Name", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill };
+                var colPreview = new DataGridViewTextBoxColumn { Name = "Preview", HeaderText = "Text Preview", Width = 400 };
+                var colDiag = new DataGridViewTextBoxColumn { Name = "Diag", HeaderText = "Diag", Width = 220 };
 
-                    // Add the window details to the ListView
-                    //ListViewItem item = new ListViewItem(new[] { hWnd.ToInt64().ToString(), windowTitle.ToString(), windowContent });
-                    ListViewItem item = new ListViewItem(new[] { process.Id.ToString(), windowTitle.ToString(), windowContent });
-                    listViewNotepadWindows.Items.Add(item);
-                }
+                // Make columns programmatic-sortable (virtual mode requires custom sorting)
+                colPid.SortMode = DataGridViewColumnSortMode.Programmatic;
+                colName.SortMode = DataGridViewColumnSortMode.Programmatic;
+                colPreview.SortMode = DataGridViewColumnSortMode.Programmatic;
+                colDiag.SortMode = DataGridViewColumnSortMode.Programmatic;
+
+                gridNotepadWindows.Columns.AddRange(new DataGridViewColumn[] { colPid, colName, colPreview, colDiag });
+
+                gridNotepadWindows.CellValueNeeded += GridNotepadWindows_CellValueNeeded;
+                gridNotepadWindows.CellDoubleClick += GridNotepadWindows_CellDoubleClick;
+                gridNotepadWindows.SelectionChanged += GridNotepadWindows_SelectionChanged;
+
+                // hook header click for sorting
+                gridNotepadWindows.ColumnHeaderMouseClick += GridNotepadWindows_ColumnHeaderMouseClick;
             }
 
-            // Sort the list after refreshing
-            listViewNotepadWindows.Sort();
-
+            if (splitContainer1 != null)
+            {
+                splitContainer1.Panel1.Controls.Clear();
+                splitContainer1.Panel1.Controls.Add(gridNotepadWindows);
+            }
         }
 
-        // Handle system shutdown/logoff event
-        private void OnSessionEnding(object sender, SessionEndingEventArgs e)
+        private void GridNotepadWindows_CellValueNeeded(object sender, DataGridViewCellValueEventArgs e)
         {
-            // Backup unsaved Notepad content before shutdown or logoff
-            BackupUnsavedNotepadContent();
+            if (e.RowIndex < 0 || e.RowIndex >= notepadWindows.Count) return;
+            var item = notepadWindows[e.RowIndex];
+            var colName = gridNotepadWindows.Columns[e.ColumnIndex].Name;
+            switch (colName)
+            {
+                case "ProcessId": e.Value = item.ProcessId.ToString(); break;
+                case "Name": e.Value = item.Title; break;
+                case "Preview":
+                    var p = item.Preview?.Replace(Environment.NewLine, " ").Trim();
+                    if (!string.IsNullOrEmpty(p) && p.Length > 200) p = p.Substring(0, 200) + "...";
+                    e.Value = p;
+                    break;
+                case "Diag": e.Value = item.Diagnostic?.Replace(Environment.NewLine, " ").Trim(); break;
+            }
         }
+
+        private void GridNotepadWindows_CellDoubleClick(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= notepadWindows.Count) return;
+            var item = notepadWindows[e.RowIndex];
+            IntPtr hwnd = item.Hwnd;
+            if (hwnd == IntPtr.Zero && item.ProcessId != 0) hwnd = FindWindowForProcess(item.ProcessId);
+            if (hwnd != IntPtr.Zero) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
+        }
+
+        private void GridNotepadWindows_SelectionChanged(object sender, EventArgs e)
+        {
+            if (gridNotepadWindows.CurrentCell == null) { textBoxNotepadContent.Text = string.Empty; return; }
+            int row = gridNotepadWindows.CurrentCell.RowIndex;
+            if (row < 0 || row >= notepadWindows.Count) return;
+            var info = notepadWindows[row];
+            string content = GetNotepadTextModern(info.Hwnd);
+            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("[")) content = GetNotepadText(info.Hwnd, -1);
+            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("Unable") || content.StartsWith("No content")) content = "Preview not available";
+            textBoxNotepadContent.Text = content;
+        }
+
+        private void PopulateNotepadWindows()
+        {
+            notepadWindows.Clear();
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                try
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+
+                    StringBuilder className = new StringBuilder(256);
+                    GetClassName(hWnd, className, className.Capacity);
+                    var cls = className.ToString();
+
+                    if (cls == "Notepad" || cls == "CascadiaWindow")
+                    {
+                        GetWindowThreadProcessId(hWnd, out uint pid);
+
+                        StringBuilder title = new StringBuilder(256);
+                        GetWindowText(hWnd, title, title.Capacity);
+
+                        string preview = GetNotepadTextModern(hWnd);
+                        bool modernFailed = string.IsNullOrWhiteSpace(preview) || preview.StartsWith("[");
+                        if (modernFailed) preview = GetNotepadText(hWnd, 5);
+
+                        string diag = preview;
+                        if (string.IsNullOrWhiteSpace(preview) || preview.StartsWith("Unable") || preview.StartsWith("No content")) preview = "[Unable to retrieve content]";
+
+                        notepadWindows.Add(new NotepadWindowInfo
+                        {
+                            Hwnd = hWnd,
+                            ProcessId = (int)pid,
+                            Title = title.ToString(),
+                            Preview = preview,
+                            Diagnostic = diag
+                        });
+                    }
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+
+            // preserve sorting if active
+            if (sortColumnIndex != -1) SortByColumn(sortColumnIndex);
+            else
+            {
+                if (gridNotepadWindows != null)
+                {
+                    gridNotepadWindows.RowCount = notepadWindows.Count;
+                    gridNotepadWindows.Invalidate();
+                }
+            }
+        }
+
+        private void OnSessionEnding(object sender, SessionEndingEventArgs e) => BackupUnsavedNotepadContent();
 
         private void BackupUnsavedNotepadContent()
         {
-            // Get all running Notepad processes
-            Process[] processes = Process.GetProcessesByName("notepad");
-            foreach (Process process in processes) {
-                try {
+            var processes = Process.GetProcessesByName("notepad");
+            foreach (var process in processes)
+            {
+                try
+                {
                     IntPtr hWnd = process.MainWindowHandle;
-                    if (hWnd != IntPtr.Zero && IsWindowVisible(hWnd)) {
-                        // Retrieve the window title
-                        StringBuilder windowTitle = new StringBuilder(256);
-                        GetWindowText(hWnd, windowTitle, windowTitle.Capacity);
-
-                        // If the window is unsaved (Untitled - Notepad), back it up
-                        if (windowTitle.ToString().Contains("Untitled - Notepad") ){
-                            // Get the content of the unsaved Notepad window (full content)
-                            string windowContent = GetNotepadText(hWnd, -1); // Full content
-                            // Create a unique backup file based on the process ID
-                            string backupFilePath = Path.Combine(backupDir, string.Format("NotepadBackup_{0}.txt", process.Id) );
-                            File.WriteAllText(backupFilePath, windowContent);
-                            Console.WriteLine(string.Format("Added/Updated notepad backup of [{0}]", backupFilePath ) );
-                        }
-                        else {
-                            // Optionally, delete existing backup if the file has been saved
-                            string backupFilePath = Path.Combine(backupDir, string.Format("NotepadBackup_{0}.txt",process.Id ) );
-                            if (File.Exists(backupFilePath)) {
-                                File.Delete(backupFilePath);
-                                Console.WriteLine(string.Format("Deteted notepad backup of [{0}]", backupFilePath ) );
-                            }
-                        }
+                    if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd)) continue;
+                    var title = new StringBuilder(256);
+                    GetWindowText(hWnd, title, title.Capacity);
+                    if (title.ToString().Contains("Untitled - Notepad"))
+                    {
+                        string content = GetNotepadText(hWnd, -1);
+                        string backupFilePath = Path.Combine(backupDir, $"NotepadBackup_{process.Id}.txt");
+                        File.WriteAllText(backupFilePath, content);
+                    }
+                    else
+                    {
+                        string backupFilePath = Path.Combine(backupDir, $"NotepadBackup_{process.Id}.txt");
+                        if (File.Exists(backupFilePath)) File.Delete(backupFilePath);
                     }
                 }
-                catch (Exception ex) {
-                    Console.WriteLine(string.Format("Error backing up notepad process {0}: {1}", process.Id, ex.Message  ) );
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error backing up notepad process {process.Id}: {ex.Message}");
                 }
             }
-
-            // Clean up backup files for processes that are no longer running
             CleanupObsoleteBackups();
         }
 
-        // Helper method to delete backup files for processes that are no longer running
         private void CleanupObsoleteBackups()
         {
             string[] backupFiles = Directory.GetFiles(backupDir, "NotepadBackup_*.txt");
-            var runningProcessIds = new HashSet<int>(Process.GetProcessesByName("notepad").Select(p => p.Id));
-            foreach (string backupFile in backupFiles) {
-                try {
-                    // Extract the process ID from the backup file name
-                    string fileName = Path.GetFileNameWithoutExtension(backupFile);
-                    int processId;
-                    string[] parts = fileName.Split('_');
-                    if (parts.Length < 2 || !int.TryParse(parts[1], out processId)) {
-                        continue; // Skip if the file name is not in the expected format
-                    }
-                    // If the process is no longer running, delete the backup file
-                    if (!runningProcessIds.Contains(processId)) {
-                        Console.WriteLine(string.Format("Process {0} is no longer running. Deleting notepad backup {1}.",processId, backupFile ) );
-                        File.Delete(backupFile);
-                    }
+            var running = new HashSet<int>(Process.GetProcessesByName("notepad").Select(p => p.Id));
+            foreach (var f in backupFiles)
+            {
+                try
+                {
+                    var name = Path.GetFileNameWithoutExtension(f);
+                    var parts = name.Split('_');
+                    if (parts.Length < 2 || !int.TryParse(parts[1], out int pid)) continue;
+                    if (!running.Contains(pid)) File.Delete(f);
                 }
-                catch (Exception ex) {
-                    Console.WriteLine(string.Format("Error deleting notepad backup {0}: {1}", backupFile, ex.Message ) );
-                }
+                catch (Exception ex) { Debug.WriteLine($"Error deleting backup {f}: {ex.Message}"); }
             }
         }
 
-
-        // Restore backups when the application starts
         private void RestoreBackupNotepadContent()
         {
             string[] backupFiles = Directory.GetFiles(backupDir, "NotepadBackup_*.txt");
+            foreach (var backupFile in backupFiles)
+            {
+                try
+                {
+                    var name = Path.GetFileNameWithoutExtension(backupFile);
+                    var parts = name.Split('_');
+                    if (parts.Length < 2 || !int.TryParse(parts[1], out int pid)) continue;
+                    bool running = Process.GetProcessesByName("notepad").Any(p => p.Id == pid);
+                    if (running) continue;
 
-            foreach (string backupFile in backupFiles) {
-                try {
-                    // Extract the process ID from the backup file name (e.g., NotepadBackup_39036.txt)
-                    string fileName = Path.GetFileNameWithoutExtension(backupFile);
-                    int processId;
-                    string[] parts = fileName.Split('_');
-                    if (parts.Length < 2 || !int.TryParse(parts[1], out processId) ) {
-                        Console.WriteLine(string.Format("Notepad file name is not in an expected format. Restore skipped [{0}].", fileName) );
-                        continue; // Skip if the file name is not in the expected format
-                    }
-
-                    // Check if the process with this ID is still running
-                    bool isProcessRunning = Process.GetProcessesByName("notepad").Any(p => p.Id == processId);
-
-                    if (isProcessRunning) {
-                        // Skip restoration if the Notepad process with this ID is still running
-                        Console.WriteLine(string.Format("Notepad process with ID {0} is still running. Skipping restore.", processId ) );
-                        continue;
-                    }
-
-                    // If the process is not running, restore the content
                     string content = File.ReadAllText(backupFile);
-
-                    // Restore it in a new Notepad window
-                    Process notepad = Process.Start("notepad.exe");
+                    var notepad = Process.Start("notepad.exe");
                     notepad.WaitForInputIdle();
-
-                    // Find the Notepad window and set its content
-                    IntPtr notepadHandle = notepad.MainWindowHandle;
-                    IntPtr editHandle = FindWindowEx(notepadHandle, IntPtr.Zero, "Edit", null);
-                    if (editHandle != IntPtr.Zero) {
-                        // Set the restored content
-                        SendMessage(editHandle, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content));
-                        // Simulate typing a space to trigger the unsaved state (*)
-                        SendMessage(editHandle, WM_CHAR, new IntPtr(' '), IntPtr.Zero); // Append space via typing simulation
-                        Console.WriteLine(string.Format("Notepad restored new process ID {0}, content [{1}] ", processId, content ) );
+                    IntPtr hwnd = notepad.MainWindowHandle;
+                    IntPtr edit = FindWindowEx(hwnd, IntPtr.Zero, "Edit", null);
+                    if (edit != IntPtr.Zero)
+                    {
+                        SendMessage(edit, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content));
+                        SendMessageInt(edit, (int)WM_CHAR, new IntPtr(' '), IntPtr.Zero);
                     }
                 }
-                catch (Exception ex) {
-                    Console.WriteLine(string.Format("Error restoring backup: {0}.[{1}]", backupFile, ex.Message ) );
-                }
+                catch (Exception ex) { Debug.WriteLine($"Error restoring backup {backupFile}: {ex.Message}"); }
             }
-        } //EOF
+        }
 
-        // Function to get the text content from the Notepad child window and limit it to the first few lines
+        private string TryGetTextFromChildClasses(IntPtr parentHandle)
+        {
+            if (parentHandle == IntPtr.Zero) return null;
+            string[] classNames = { "Edit", "RichEdit20W", "RichEdit20A", "RICHEDIT50W", "RichEditD2DPT", "RichEdit50W" };
+            string result = null;
+            EnumChildWindows(parentHandle, (child, lparam) =>
+            {
+                try
+                {
+                    var cls = new StringBuilder(256);
+                    GetClassName(child, cls, cls.Capacity);
+                    string cn = cls.ToString();
+                    if (classNames.Contains(cn))
+                    {
+                        int len = (int)SendMessage(child, WM_GETTEXTLENGTH, IntPtr.Zero, null);
+                        if (len > 0)
+                        {
+                            var sb = new StringBuilder(len + 1);
+                            SendMessage(child, WM_GETTEXT, (IntPtr)sb.Capacity, sb);
+                            var text = sb.ToString();
+                            if (!string.IsNullOrWhiteSpace(text)) { result = text; return false; }
+                        }
+                    }
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+            return result;
+        }
+
+        private string GetNotepadTextModern(IntPtr windowHandle)
+        {
+            try
+            {
+                var windowElement = AutomationElement.FromHandle(windowHandle);
+                if (windowElement == null) return "[UIA: window element null]";
+
+                ControlType[] tryTypes = { ControlType.Edit, ControlType.Document, ControlType.Pane, ControlType.Custom, ControlType.Group, ControlType.Text };
+                foreach (var ct in tryTypes)
+                {
+                    var element = windowElement.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ct));
+                    if (element == null) continue;
+
+                    object patternObj;
+                    if (element.TryGetCurrentPattern(ValuePattern.Pattern, out patternObj))
+                    {
+                        var valuePattern = (ValuePattern)patternObj;
+                        var v = valuePattern.Current.Value;
+                        if (!string.IsNullOrWhiteSpace(v)) return v;
+                    }
+
+                    if (element.TryGetCurrentPattern(TextPattern.Pattern, out patternObj))
+                    {
+                        var textPattern = (TextPattern)patternObj;
+                        string doc = textPattern.DocumentRange.GetText(-1);
+                        if (!string.IsNullOrWhiteSpace(doc)) return doc;
+                    }
+
+                    var name = element.Current.Name;
+                    if (!string.IsNullOrWhiteSpace(name)) return name;
+                }
+
+                var textNodes = windowElement.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text));
+                if (textNodes != null && textNodes.Count > 0)
+                {
+                    var sb = new StringBuilder();
+                    for (int i = 0; i < textNodes.Count; i++)
+                    {
+                        try
+                        {
+                            var n = textNodes[i].Current.Name;
+                            if (!string.IsNullOrWhiteSpace(n))
+                            {
+                                if (sb.Length > 0) sb.AppendLine();
+                                sb.Append(n);
+                            }
+                        }
+                        catch { }
+                    }
+                    if (sb.Length > 0) return sb.ToString();
+                }
+
+                var win32Text = TryGetTextFromChildClasses(windowHandle);
+                if (!string.IsNullOrWhiteSpace(win32Text)) return win32Text;
+
+                return "[No UIA text found]";
+            }
+            catch (Exception ex) { return $"[UIA error: {ex.Message}]"; }
+        }
+
         static string GetNotepadText(IntPtr notepadHandle, int maxLines = 2)
         {
-            // Find the child window (edit control) of the Notepad window
             IntPtr editHandle = FindWindowEx(notepadHandle, IntPtr.Zero, "Edit", null);
-
-            if (editHandle == IntPtr.Zero) {
-                return "Unable to find text content.";
-            }
-
-            // Get the length of the text in the child window (edit control)
+            if (editHandle == IntPtr.Zero) return "Unable to find text content.";
             int textLength = (int)SendMessage(editHandle, WM_GETTEXTLENGTH, IntPtr.Zero, null);
-
-            // If there is no text, return an empty string
-            if (textLength == 0) {
-                return "No content available.";
-            }
-
-            // Create a StringBuilder to hold the text
-            StringBuilder windowText = new StringBuilder(textLength + 1);
-
-            // Send a message to the Notepad child window to retrieve the text
+            if (textLength == 0) return "No content available.";
+            var windowText = new StringBuilder(textLength + 1);
             SendMessage(editHandle, WM_GETTEXT, (IntPtr)windowText.Capacity, windowText);
-
-            // Convert the text to string and split it into lines
-            string[] lines = windowText.ToString().Split(new[] { Environment.NewLine }, StringSplitOptions.None);
-            string[] sShowLines = lines;
-            var nonEmptyLines = lines.SkipWhile(line => string.IsNullOrWhiteSpace(line)).ToArray();
-            if (nonEmptyLines.Length != 0) {
-                sShowLines = nonEmptyLines;
-            }
-
-            // Return only the first few lines (up to maxLines)
-            if (maxLines == -1) {
-                //return all lines
-                return string.Join(Environment.NewLine, sShowLines); // Full content
-            }
-            return string.Join(Environment.NewLine, sShowLines, 0, Math.Min(maxLines, sShowLines.Length));
-        } //EOF
-
-        // Set up ListView columns
-        private void SetupListViewColumns()
-        {
-            // Create the columns for ListView programmatically
-            listViewNotepadWindows.Columns.Add("Process ID", 150, HorizontalAlignment.Left);
-            listViewNotepadWindows.Columns.Add("Name", 250, HorizontalAlignment.Left);
-            listViewNotepadWindows.Columns.Add("Text Preview", 400, HorizontalAlignment.Left);
-
-            // Set ListView properties
-            listViewNotepadWindows.View = View.Details;
-            listViewNotepadWindows.FullRowSelect = true;
-            listViewNotepadWindows.GridLines = true;
-
-            // Attach column click event for sorting
-            listViewNotepadWindows.ColumnClick += new ColumnClickEventHandler(ColumnClick);
-
-            // Attach the double-click event handler for bringing the Notepad window to the front
-            listViewNotepadWindows.DoubleClick += new EventHandler(ListViewItem_DoubleClick);
+            var lines = windowText.ToString().Split(new[] { Environment.NewLine }, StringSplitOptions.None);
+            var nonEmpty = lines.SkipWhile(line => string.IsNullOrWhiteSpace(line)).ToArray();
+            var use = nonEmpty.Length != 0 ? nonEmpty : lines;
+            if (maxLines == -1) return string.Join(Environment.NewLine, use);
+            return string.Join(Environment.NewLine, use, 0, Math.Min(maxLines, use.Length));
         }
 
-        private void ListViewItem_DoubleClick_Windows_ID(object sender, EventArgs e)
+        private IntPtr FindWindowForProcess(int processId)
         {
-            if (listViewNotepadWindows.SelectedItems.Count > 0) {
-                // Get the selected ListView item
-                ListViewItem selectedItem = listViewNotepadWindows.SelectedItems[0];
-                // The window handle (Windows ID) is stored in the first column (index 0)
-                IntPtr notepadHandle = new IntPtr(long.Parse(selectedItem.SubItems[0].Text));
-
-                // Check if the window handle is valid and bring the window to the front
-                if (notepadHandle != IntPtr.Zero) {
-                    // Restore the window if it is minimized
-                    ShowWindow(notepadHandle, SW_RESTORE);
-                    // Bring the Notepad window to the foreground
-                    SetForegroundWindow(notepadHandle);
-                }
-            }
-        }
-
-        private void ListViewItem_DoubleClick(object sender, EventArgs e)
-        {
-            if (listViewNotepadWindows.SelectedItems.Count > 0) {
-                // Get the selected ListView item
-                ListViewItem selectedItem = listViewNotepadWindows.SelectedItems[0];
-                // The process ID is stored in the first column (index 0)
-                int processId = int.Parse(selectedItem.SubItems[0].Text);
-                // Find the process with this ID
-                Process process = Process.GetProcessesByName("notepad").FirstOrDefault(p => p.Id == processId);
-                if (process != null) {
-                    IntPtr notepadHandle = process.MainWindowHandle;
-                    // Check if the window handle is valid and bring the window to the front
-                    if (notepadHandle != IntPtr.Zero) {
-                        // Restore the window if it is minimized
-                        ShowWindow(notepadHandle, SW_RESTORE);
-                        // Bring the Notepad window to the foreground
-                        SetForegroundWindow(notepadHandle);
-                    }
-                }
-            }
-        } //EOF
-
-
-        // Handle the column click event to sort by the clicked column
-        private void ColumnClick(object o, ColumnClickEventArgs e)
-        {
-            // Determine if the clicked column is already the column that is being sorted.
-            if (e.Column == sortColumn) {
-                // Reverse the current sort direction for this column.
-                if (listViewNotepadWindows.Sorting == SortOrder.Ascending ) {
-                    listViewNotepadWindows.Sorting = SortOrder.Descending;
-                }
-                else {
-                    listViewNotepadWindows.Sorting = SortOrder.Ascending;
-                }
-            }
-            else {
-                // Set the column number that is to be sorted; default to ascending.
-                sortColumn = e.Column;
-                listViewNotepadWindows.Sorting = SortOrder.Ascending;
-            }
-
-            // Set the ListViewItemSorter property to a new ListViewItemComparer
-            listViewNotepadWindows.ListViewItemSorter = new ListViewItemComparer(e.Column, listViewNotepadWindows.Sorting);
-            // Perform the sort with the new sort options.
-            listViewNotepadWindows.Sort();
-        }
-
-        // Custom comparer for sorting ListView items by columns (including numeric sorting for Windows ID)
-        class ListViewItemComparer : IComparer
-        {
-            private int col;
-            private SortOrder order;
-
-            public ListViewItemComparer(int column, SortOrder order) {
-                col = column;
-                this.order = order;
-            }
-
-            public int Compare(object x, object y) {
-                int returnVal = -1;
-
-                // Check if we are sorting by the "Windows/Process ID" column (index 0), which needs numeric sorting
-                if (col == 0)
+            IntPtr found = IntPtr.Zero;
+            EnumWindows((hWnd, lParam) =>
+            {
+                try
                 {
-                    // Parse the Windows ID as long and compare numerically
-                    long id1 = long.Parse(((ListViewItem)x).SubItems[col].Text);
-                    long id2 = long.Parse(((ListViewItem)y).SubItems[col].Text);
-                    returnVal = id1.CompareTo(id2);
+                    if (!IsWindowVisible(hWnd)) return true;
+                    GetWindowThreadProcessId(hWnd, out uint pid);
+                    if (pid == (uint)processId) { found = hWnd; return false; }
                 }
-                else
-                {
-                    // For other columns, perform string comparison
-                    returnVal = String.Compare(((ListViewItem)x).SubItems[col].Text,
-                                               ((ListViewItem)y).SubItems[col].Text);
-                }
-
-                // If descending order is required, reverse the result
-                if (order == SortOrder.Descending)
-                    returnVal *= -1;
-
-                return returnVal;
-            }
-        } //EOC
-
-        private void ListViewItem_SelectedIndexChanged_Windows_ID(object sender, EventArgs e)
-        {
-            if (listViewNotepadWindows.SelectedItems.Count > 0) {
-                // Get the selected ListView item
-                ListViewItem selectedItem = listViewNotepadWindows.SelectedItems[0];
-                // The window handle (Windows ID) is stored in the first column (index 0)
-                IntPtr notepadHandle = new IntPtr(long.Parse(selectedItem.SubItems[0].Text));
-
-                if (notepadHandle != IntPtr.Zero) {
-                    // Get the content of the Notepad window (limit to first 500 lines)
-                    string notepadContent = GetNotepadText(notepadHandle, 500);
-
-                    // Set the content to the TextBox
-                    textBoxNotepadContent.Text = notepadContent;
-                }
-            }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+            return found;
         }
-
-        private void ListViewItem_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            if (listViewNotepadWindows.SelectedItems.Count > 0) {
-                // Get the selected ListView item
-                ListViewItem selectedItem = listViewNotepadWindows.SelectedItems[0];
-                // The process ID is stored in the first column (index 0)
-                int processId = int.Parse(selectedItem.SubItems[0].Text);
-                // Find the process with this ID
-                Process process = Process.GetProcessesByName("notepad").FirstOrDefault(p => p.Id == processId);
-                if (process != null) {
-                    IntPtr notepadHandle = process.MainWindowHandle;
-                    if (notepadHandle != IntPtr.Zero)
-                    {
-                        // Get the content of the Notepad window (limit to first 500 lines)
-                        string notepadContent = GetNotepadText(notepadHandle, 500);
-                        // Set the content to the RichTextBox (or TextBox)
-                        textBoxNotepadContent.Text = notepadContent;
-                    }
-                }
-            } //EIF
-        } //EOF
-
 
         private void TextBoxSearch_TextChanged(object sender, EventArgs e)
         {
+            searchDebounceTimer.Stop();
+            searchDebounceTimer.Start();
+        }
+
+        private void SearchDebounceTimer_Tick(object sender, EventArgs e)
+        {
+            searchDebounceTimer.Stop();
+            PerformSearch();
+        }
+
+        private void PerformSearch()
+        {
             string searchText = textBoxSearch.Text.ToLower();
+            notepadWindows.Clear();
 
-            // Clear the existing list before updating
-            listViewNotepadWindows.Items.Clear();
-
-            // Get all running Notepad processes
-            Process[] processes = Process.GetProcessesByName("notepad");
-
-            // Iterate over each Notepad process
-            foreach (Process process in processes) {
-                IntPtr hWnd = process.MainWindowHandle;
-
-                if (hWnd != IntPtr.Zero && IsWindowVisible(hWnd)) {
-                    // Retrieve the window title
-                    StringBuilder windowTitle = new StringBuilder(256);
-                    GetWindowText(hWnd, windowTitle, windowTitle.Capacity);
-                    // Get the actual text content from the Notepad child window (limited to the first 500 lines)
-                    string windowContent = GetNotepadText(hWnd, 500); // Search within the full content
-                    // Check if the content or title contains the search text
-                    if (windowContent.ToLower().Contains(searchText) || windowTitle.ToString().ToLower().Contains(searchText) ) {
-                        // Add the window/process details to the ListView
-                        //ListViewItem item = new ListViewItem(new[] { hWnd.ToInt64().ToString(), windowTitle.ToString(), windowContent });
-                        ListViewItem item = new ListViewItem(new[] { process.Id.ToString(), windowTitle.ToString(), windowContent } );
-                        item.Tag = windowContent;
-                        listViewNotepadWindows.Items.Add(item);
+            EnumWindows((hWnd, lParam) =>
+            {
+                try
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+                    var cls = new StringBuilder(256);
+                    GetClassName(hWnd, cls, cls.Capacity);
+                    if (cls.ToString() == "Notepad" || cls.ToString() == "CascadiaWindow")
+                    {
+                        GetWindowThreadProcessId(hWnd, out uint pid);
+                        var title = new StringBuilder(256);
+                        GetWindowText(hWnd, title, title.Capacity);
+                        string windowContent = GetNotepadTextModern(hWnd);
+                        bool modernFailed = string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("[");
+                        if (modernFailed) windowContent = GetNotepadText(hWnd, 5);
+                        if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("Unable") || windowContent.StartsWith("No content"))
+                            windowContent = "[Unable to retrieve content]";
+                        if (windowContent.ToLower().Contains(searchText) || title.ToString().ToLower().Contains(searchText))
+                        {
+                            notepadWindows.Add(new NotepadWindowInfo { Hwnd = hWnd, ProcessId = (int)pid, Title = title.ToString(), Preview = windowContent, Diagnostic = windowContent });
+                        }
                     }
                 }
-            } //EFOR
+                catch { }
+                return true;
+            }, IntPtr.Zero);
 
-            // Sort the list after filtering
-            listViewNotepadWindows.Sort();
+            // preserve sort
+            if (sortColumnIndex != -1) SortByColumn(sortColumnIndex);
+            else
+            {
+                if (gridNotepadWindows != null)
+                {
+                    gridNotepadWindows.RowCount = notepadWindows.Count;
+                    gridNotepadWindows.Invalidate();
+                    if (gridNotepadWindows.CurrentCell != null) GridNotepadWindows_SelectionChanged(this, EventArgs.Empty);
+                }
+            }
+        }
 
-            // If a Notepad window is selected, highlight the text in the content box
-            if (listViewNotepadWindows.SelectedItems.Count > 0) {
-                ListViewItem selectedItem = listViewNotepadWindows.SelectedItems[0];
-                string notepadContent = selectedItem.Tag as string;
-                textBoxNotepadContent.Text = notepadContent;
-                HighlightSearchText(searchText);
-            } //EIF
+        private void btnRefresh_Click(object sender, EventArgs e) => PopulateNotepadWindows();
+        private void btnFontIncrease_Click(object sender, EventArgs e) { currentFontSize = Math.Min(48F, currentFontSize + 2F);                             UpdateFonts(); }
+        private void btnFontDecrease_Click(object sender, EventArgs e) { currentFontSize = Math.Max(8F, currentFontSize - 2F); UpdateFonts(); }
 
-        } //EOF
+        private void NotepadsManager_Load(object sender, EventArgs e)
+        {
+            try { this.Icon = ManageCMDWindows.Properties.Resources.notepad_manager_icon; } catch { }
+            int screenWidth = Screen.PrimaryScreen.WorkingArea.Width;
+            int screenHeight = Screen.PrimaryScreen.WorkingArea.Height;
+            this.Width = (int)(screenWidth * 0.8);
+            this.Height = (int)(screenHeight * 0.7);
+            this.StartPosition = FormStartPosition.CenterScreen;
+            if (splitContainer1 != null) splitContainer1.SplitterDistance = (int)(splitContainer1.Width * 0.4);
+            PopulateNotepadWindows();
+        }
 
+        private void SetFontRecursive(Control control, Font font)
+        {
+            control.Font = font;
+            foreach (Control child in control.Controls) SetFontRecursive(child, font);
+        }
+
+        private void UpdateFonts()
+        {
+            var font = new Font(this.Font.FontFamily, currentFontSize, this.Font.Style);
+            SetFontRecursive(this, font);
+        }
+
+        // Custom sort handler for virtual DataGridView
+        private void GridNotepadWindows_ColumnHeaderMouseClick(object sender, DataGridViewCellMouseEventArgs e)
+        {
+            if (e.ColumnIndex < 0 || e.ColumnIndex >= gridNotepadWindows.Columns.Count) return;
+
+            if (sortColumnIndex == e.ColumnIndex)
+                sortAscending = !sortAscending;
+            else
+            {
+                sortColumnIndex = e.ColumnIndex;
+                sortAscending = true;
+            }
+
+            SortByColumn(sortColumnIndex);
+
+            // update glyphs
+            foreach (DataGridViewColumn col in gridNotepadWindows.Columns)
+                col.HeaderCell.SortGlyphDirection = SortOrder.None;
+
+            gridNotepadWindows.Columns[sortColumnIndex].HeaderCell.SortGlyphDirection = sortAscending ? SortOrder.Ascending : SortOrder.Descending;
+        }
+
+        // sorts the in-memory list and refreshes the virtual grid
+        private void SortByColumn(int columnIndex)
+        {
+            if (columnIndex < 0 || columnIndex >= gridNotepadWindows.Columns.Count) return;
+            var name = gridNotepadWindows.Columns[columnIndex].Name;
+            IEnumerable<NotepadWindowInfo> sorted;
+
+            switch (name)
+            {
+                case "ProcessId":
+                    sorted = sortAscending ? notepadWindows.OrderBy(n => n.ProcessId) : notepadWindows.OrderByDescending(n => n.ProcessId);
+                    break;
+                case "Name":
+                    sorted = sortAscending ? notepadWindows.OrderBy(n => n.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : notepadWindows.OrderByDescending(n => n.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "Preview":
+                    sorted = sortAscending ? notepadWindows.OrderBy(n => n.Preview ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : notepadWindows.OrderByDescending(n => n.Preview ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "Diag":
+                    sorted = sortAscending ? notepadWindows.OrderBy(n => n.Diagnostic ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : notepadWindows.OrderByDescending(n => n.Diagnostic ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                default:
+                    return;
+            }
+
+            notepadWindows = sorted.ToList();
+
+            if (gridNotepadWindows != null)
+            {
+                gridNotepadWindows.RowCount = notepadWindows.Count;
+                gridNotepadWindows.Invalidate();
+                if (gridNotepadWindows.CurrentCell != null) GridNotepadWindows_SelectionChanged(this, EventArgs.Empty);
+            }
+        }
+
+        // Minimal InitializeComponent - creates controls used by the class.
         private void InitializeComponent()
         {
-            System.ComponentModel.ComponentResourceManager resources = new System.ComponentModel.ComponentResourceManager(typeof(NotepadsManager));
-            this.refresh = new System.Windows.Forms.Button();
-            //
-            //this.textBoxSearch = new System.Windows.Forms.TextBox();
-            this.textBoxSearch = new MaterialSkin.Controls.MaterialTextBox2();
-            this.clearSearchButton = new System.Windows.Forms.PictureBox();
-            //
-            this.splitContainer1 = new System.Windows.Forms.SplitContainer();
-            this.listViewNotepadWindows = new System.Windows.Forms.ListView();
-            //
-            //this.textBoxNotepadContent = new System.Windows.Forms.TextBox();
-            this.textBoxNotepadContent = new System.Windows.Forms.RichTextBox(); 
-            //
-            this.panelTop = new System.Windows.Forms.Panel();
+            this.refresh = new Button();
+            this.btnFontIncrease = new Button();
+            this.btnFontDecrease = new Button();
+            this.textBoxSearch = new MaterialTextBox2();
+            this.splitContainer1 = new SplitContainer();
+            this.textBoxNotepadContent = new RichTextBox();
+            this.panelTop = new Panel();
+
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).BeginInit();
             this.splitContainer1.Panel1.SuspendLayout();
             this.splitContainer1.Panel2.SuspendLayout();
             this.splitContainer1.SuspendLayout();
             this.panelTop.SuspendLayout();
-            this.SuspendLayout();
-            // 
+
             // refresh
-            // 
-            this.refresh.Dock = System.Windows.Forms.DockStyle.Top;
-            this.refresh.Location = new System.Drawing.Point(0, 0);
-            this.refresh.Name = "refresh";
-            this.refresh.Size = new System.Drawing.Size(850, 23);
-            this.refresh.TabIndex = 0;
+            this.refresh.Dock = DockStyle.Left;
+            this.refresh.Size = new Size(120, 70);
             this.refresh.Text = "Refresh";
-            this.refresh.UseVisualStyleBackColor = true;
-            this.refresh.Click += new System.EventHandler(this.btnRefresh_Click);
-            // 
+            this.refresh.Click += new EventHandler(this.btnRefresh_Click);
+
+            // btnFontIncrease
+            this.btnFontIncrease.Dock = DockStyle.Right;
+            this.btnFontIncrease.Size = new Size(100, 70);
+            this.btnFontIncrease.Text = "Zoom +";
+            this.btnFontIncrease.Click += new EventHandler(this.btnFontIncrease_Click);
+
+            // btnFontDecrease
+            this.btnFontDecrease.Dock = DockStyle.Right;
+            this.btnFontDecrease.Size = new Size(100, 70);
+            this.btnFontDecrease.Text = "Zoom -";
+            this.btnFontDecrease.Click += new EventHandler(this.btnFontDecrease_Click);
+
             // textBoxSearch
-            //// 
-            //this.textBoxSearch.Dock = System.Windows.Forms.DockStyle.Top;
-            //this.textBoxSearch.Location = new System.Drawing.Point(0, 23);
-            //this.textBoxSearch.Name = "textBoxSearch";
-            //this.textBoxSearch.Size = new System.Drawing.Size(850, 20);
-            //this.textBoxSearch.Hint = "Search...";
-            //this.textBoxSearch.TabIndex = 1;
-            //this.textBoxSearch.TextChanged += new System.EventHandler(this.TextBoxSearch_TextChanged);
-            // NEW
-            this.textBoxSearch.Dock = System.Windows.Forms.DockStyle.Top;
-            this.textBoxSearch.Location = new System.Drawing.Point(0, 23);
-            this.textBoxSearch.Name = "textBoxSearch";
-            this.textBoxSearch.Font = new System.Drawing.Font("Roboto", 8F, System.Drawing.FontStyle.Regular, System.Drawing.GraphicsUnit.Pixel);
-            this.textBoxSearch.Margin = new System.Windows.Forms.Padding(0);
-            this.textBoxSearch.Size = new System.Drawing.Size(850, 18); // Adjusted height to reduce gap and align to top
+            this.textBoxSearch.Dock = DockStyle.Fill;
             this.textBoxSearch.Hint = "Search...";
-            this.textBoxSearch.LeadingIcon = null;  // Optional: Set this if you want a leading icon
-            //this.textBoxSearch.TrailingIcon = Properties.Resources.clear_icon;  // Your clear icon image
-            //this.textBoxSearch.MaxLength = 50;  // Adjust this as needed
-            this.textBoxSearch.MouseState = MaterialSkin.MouseState.OUT;
-            this.textBoxSearch.TabIndex = 1;
-            this.textBoxSearch.TrailingIconClick += new System.EventHandler(this.ClearSearchBox);  // Event for clear button
-            this.textBoxSearch.TextChanged += new System.EventHandler(this.TextBoxSearch_TextChanged);
-            // 
+            this.textBoxSearch.TrailingIconClick += new EventHandler(this.ClearSearchBox);
+            this.textBoxSearch.TextChanged += new EventHandler(this.TextBoxSearch_TextChanged);
+
             // splitContainer1
-            // 
-            this.splitContainer1.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.splitContainer1.Location = new System.Drawing.Point(0, 43);
-            this.splitContainer1.Name = "splitContainer1";
-            // 
-            // splitContainer1.Panel1
-            // 
-            this.splitContainer1.Panel1.Controls.Add(this.listViewNotepadWindows);
-            // 
-            // splitContainer1.Panel2
-            // 
+            this.splitContainer1.Dock = DockStyle.Fill;
+            this.splitContainer1.Location = new Point(0, 70);
+            this.splitContainer1.Size = new Size(850, 507);
+            this.splitContainer1.SplitterDistance = 350;
             this.splitContainer1.Panel2.Controls.Add(this.textBoxNotepadContent);
-            this.splitContainer1.Size = new System.Drawing.Size(850, 507);
-            this.splitContainer1.SplitterDistance = 283;
-            this.splitContainer1.TabIndex = 4;
-            // 
-            // listViewNotepadWindows
-            // 
-            this.listViewNotepadWindows.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.listViewNotepadWindows.FullRowSelect = true;
-            this.listViewNotepadWindows.GridLines = true;
-            this.listViewNotepadWindows.Location = new System.Drawing.Point(0, 0);
-            this.listViewNotepadWindows.Name = "listViewNotepadWindows";
-            this.listViewNotepadWindows.Size = new System.Drawing.Size(283, 507);
-            this.listViewNotepadWindows.TabIndex = 4;
-            this.listViewNotepadWindows.UseCompatibleStateImageBehavior = false;
-            this.listViewNotepadWindows.View = System.Windows.Forms.View.Details;
-            this.listViewNotepadWindows.SelectedIndexChanged += new System.EventHandler(this.ListViewItem_SelectedIndexChanged);
-            // 
+
             // textBoxNotepadContent
-            // 
-            this.textBoxNotepadContent.Dock = System.Windows.Forms.DockStyle.Fill;
-            this.textBoxNotepadContent.Location = new System.Drawing.Point(0, 0);
-            this.textBoxNotepadContent.Multiline = true;
-            this.textBoxNotepadContent.Name = "textBoxNotepadContent";
+            this.textBoxNotepadContent.Dock = DockStyle.Fill;
             this.textBoxNotepadContent.ReadOnly = true;
-            //this.textBoxNotepadContent.ScrollBars = System.Windows.Forms.ScrollBars.Vertical;
             this.textBoxNotepadContent.ScrollBars = RichTextBoxScrollBars.Vertical;
-            this.textBoxNotepadContent.Size = new System.Drawing.Size(563, 507);
-            this.textBoxNotepadContent.TabIndex = 3;
-            // 
+
             // panelTop
-            // 
+            this.panelTop.Dock = DockStyle.Top;
+            this.panelTop.Size = new Size(850, 70);
             this.panelTop.Controls.Add(this.textBoxSearch);
+            this.panelTop.Controls.Add(this.btnFontDecrease);
+            this.panelTop.Controls.Add(this.btnFontIncrease);
             this.panelTop.Controls.Add(this.refresh);
-            this.panelTop.Dock = System.Windows.Forms.DockStyle.Top;
-            this.panelTop.Location = new System.Drawing.Point(0, 0);
-            this.panelTop.Name = "panelTop";
-            this.panelTop.Size = new System.Drawing.Size(850, 70);
-            this.panelTop.TabIndex = 5;
-            // 
-            // NotepadsManager
-            // 
-            this.ClientSize = new System.Drawing.Size(850, 550);
+
+            // allow drag by panelTop
+            this.panelTop.MouseDown += (s, e) =>
+            {
+                if (e.Button == MouseButtons.Left) { ReleaseCapture(); SendMessageInt(this.Handle, WM_NCLBUTTONDOWN, new IntPtr(HTCAPTION), IntPtr.Zero); }
+            };
+
+            // Form
+            this.ClientSize = new Size(850, 577);
             this.Controls.Add(this.splitContainer1);
             this.Controls.Add(this.panelTop);
-            this.Icon = ((System.Drawing.Icon)(resources.GetObject("$this.Icon")));
-            this.Name = "NotepadsManager";
             this.Text = "Notepad Manager";
-            this.Load += new System.EventHandler(this.NotepadManager_Load);
+            this.Load += new EventHandler(this.NotepadsManager_Load);
+
             this.splitContainer1.Panel1.ResumeLayout(false);
             this.splitContainer1.Panel2.ResumeLayout(false);
-            this.splitContainer1.Panel2.PerformLayout();
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).EndInit();
             this.splitContainer1.ResumeLayout(false);
             this.panelTop.ResumeLayout(false);
-            this.panelTop.PerformLayout();
-            this.ResumeLayout(false);
-
         }
 
-        private void ClearSearchBox(object sender, EventArgs e)
-        {
-            textBoxSearch.Text = string.Empty;  // Clears the search box
-        }
-
-        private void HighlightSearchText(string searchText)
-        {
-            // Reset all formatting
-            textBoxNotepadContent.SelectAll();
-            textBoxNotepadContent.SelectionBackColor = textBoxNotepadContent.BackColor;
-            textBoxNotepadContent.SelectionColor = textBoxNotepadContent.ForeColor;
-            textBoxNotepadContent.SelectionFont = textBoxNotepadContent.Font;
-
-            if (string.IsNullOrEmpty(searchText))
-                return;
-
-            string content = textBoxNotepadContent.Text.ToLower();
-            int startIndex = 0;
-
-            // Search and highlight all occurrences of the search text
-            while ((startIndex = content.IndexOf(searchText.ToLower(), startIndex)) != -1)
-            {
-                // Select the found text
-                textBoxNotepadContent.Select(startIndex, searchText.Length);
-
-                // Apply formatting (bold blue)
-                textBoxNotepadContent.SelectionColor = Color.Blue;
-                textBoxNotepadContent.SelectionFont = new Font(textBoxNotepadContent.Font, FontStyle.Bold);
-
-                // Move past the current found item for further searching
-                startIndex += searchText.Length;
-            }
-
-            // Reset selection to the start of the text
-            textBoxNotepadContent.Select(0, 0);
-
-            // Force the control to refresh to reflect the changes
-            textBoxNotepadContent.Refresh();
-        }
-
-
-        private void NotepadManager_Load(object sender, EventArgs e)
-        {
-            this.Icon = ManageCMDWindows.Properties.Resources.notepad_manager_icon;
-
-            // Get the screen dimensions
-            int screenWidth = Screen.PrimaryScreen.WorkingArea.Width;
-            int screenHeight = Screen.PrimaryScreen.WorkingArea.Height;
-
-            // Set the form size to 60% of the screen's width and 50% of the screen's height
-            this.Width = (int)(screenWidth * 0.8);
-            this.Height = (int)(screenHeight * 0.7);
-
-            // Center the form on the screen
-            this.StartPosition = FormStartPosition.CenterScreen;
-
-            // Set the split ratio (70% for Panel1, 30% for Panel2)
-            splitContainer1.SplitterDistance = (int)(this.splitContainer1.Width * 0.6);
-
-            // Automatically populate the list of Notepad windows on form load
-            PopulateNotepadWindows();
-
-            // Automatically sort by the "Name" column (index 1) in ascending order
-            listViewNotepadWindows.ListViewItemSorter = new ListViewItemComparer(1, SortOrder.Ascending);
-            listViewNotepadWindows.Sort();
-            //Invalidate to redraw
-            textBoxSearch.Invalidate();
-        }
-
+        private void ClearSearchBox(object sender, EventArgs e) { textBoxSearch.Text = string.Empty; }
     }
 }
