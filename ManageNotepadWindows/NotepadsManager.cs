@@ -44,6 +44,15 @@ namespace ManageNotepadWindows
         private AntdUI.Button btnFontIncrease;
         private AntdUI.Button btnFontDecrease;
 
+        // Tab control
+        private TabControl tabControl;
+
+        // Browser tabs (for future implementation)
+        private DataGridView gridBrowserTabs;
+        private List<BrowserTabInfo> browserTabs = new List<BrowserTabInfo>();
+        private RichTextBox textBoxBrowserContent;
+        private SplitContainer splitContainerBrowser;
+
         // Native helpers (consolidated)
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool IsWindowVisible(IntPtr hWnd);
@@ -97,6 +106,15 @@ namespace ManageNotepadWindows
             public string Title;
             public string Preview;
             public string Diagnostic;
+        }
+
+        private class BrowserTabInfo
+        {
+            public IntPtr Hwnd;
+            public int ProcessId;
+            public string Title;
+            public string Url;
+            public string Preview;
         }
 
         public NotepadsManager()
@@ -752,11 +770,17 @@ namespace ManageNotepadWindows
             this.splitContainer1 = new SplitContainer();
             this.textBoxNotepadContent = new RichTextBox();
             this.panelTop = new System.Windows.Forms.Panel();
+            this.tabControl = new TabControl();
+            this.splitContainerBrowser = new SplitContainer();
+            this.textBoxBrowserContent = new RichTextBox();
 
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).BeginInit();
             this.splitContainer1.Panel1.SuspendLayout();
             this.splitContainer1.Panel2.SuspendLayout();
             this.splitContainer1.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerBrowser)).BeginInit();
+            this.splitContainerBrowser.Panel2.SuspendLayout();
+            this.splitContainerBrowser.SuspendLayout();
             this.panelTop.SuspendLayout();
 
             // refresh
@@ -797,10 +821,9 @@ namespace ManageNotepadWindows
                 }
             };
 
-            // splitContainer1
+            // splitContainer1 (Notepads tab)
             this.splitContainer1.Dock = DockStyle.Fill;
-            this.splitContainer1.Location = new Point(0, 70);
-            this.splitContainer1.Size = new Size(850, 507);
+            this.splitContainer1.Size = new Size(850, 437);
             this.splitContainer1.SplitterDistance = 350;
             this.splitContainer1.SplitterWidth = 16;
             this.splitContainer1.BorderStyle = BorderStyle.Fixed3D;
@@ -810,6 +833,35 @@ namespace ManageNotepadWindows
             this.textBoxNotepadContent.Dock = DockStyle.Fill;
             this.textBoxNotepadContent.ReadOnly = true;
             this.textBoxNotepadContent.ScrollBars = RichTextBoxScrollBars.Vertical;
+
+            // splitContainerBrowser (Browser Tabs tab)
+            this.splitContainerBrowser.Dock = DockStyle.Fill;
+            this.splitContainerBrowser.Size = new Size(850, 437);
+            this.splitContainerBrowser.SplitterDistance = 350;
+            this.splitContainerBrowser.SplitterWidth = 16;
+            this.splitContainerBrowser.BorderStyle = BorderStyle.Fixed3D;
+            this.splitContainerBrowser.Panel2.Controls.Add(this.textBoxBrowserContent);
+
+            // textBoxBrowserContent
+            this.textBoxBrowserContent.Dock = DockStyle.Fill;
+            this.textBoxBrowserContent.ReadOnly = true;
+            this.textBoxBrowserContent.ScrollBars = RichTextBoxScrollBars.Vertical;
+            this.textBoxBrowserContent.Text = "Browser tab preview will appear here...";
+
+            // tabControl
+            this.tabControl.Dock = DockStyle.Fill;
+            this.tabControl.Location = new Point(0, 70);
+            this.tabControl.Size = new Size(850, 507);
+
+            // Create tab pages
+            var tabNotepads = new System.Windows.Forms.TabPage("Notepads");
+            tabNotepads.Controls.Add(this.splitContainer1);
+
+            var tabBrowser = new System.Windows.Forms.TabPage("Browser Tabs");
+            tabBrowser.Controls.Add(this.splitContainerBrowser);
+
+            this.tabControl.TabPages.Add(tabNotepads);
+            this.tabControl.TabPages.Add(tabBrowser);
 
             // panelTop
             this.panelTop.Dock = DockStyle.Top;
@@ -828,7 +880,7 @@ namespace ManageNotepadWindows
 
             // Form
             this.ClientSize = new Size(850, 577);
-            this.Controls.Add(this.splitContainer1);
+            this.Controls.Add(this.tabControl);
             this.Controls.Add(this.panelTop);
             this.Text = "Notepad Manager";
             this.Load += new EventHandler(this.NotepadsManager_Load);
@@ -837,6 +889,9 @@ namespace ManageNotepadWindows
             this.splitContainer1.Panel2.ResumeLayout(false);
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).EndInit();
             this.splitContainer1.ResumeLayout(false);
+            this.splitContainerBrowser.Panel2.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerBrowser)).EndInit();
+            this.splitContainerBrowser.ResumeLayout(false);
             this.panelTop.ResumeLayout(false);
         }
 
