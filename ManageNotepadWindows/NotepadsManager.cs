@@ -8,13 +8,12 @@ using System.Linq;
 using System.Drawing;
 using System.Windows.Forms;
 using System.Windows.Automation;
-using MaterialSkin;
-using MaterialSkin.Controls;
+using AntdUI;
 using Microsoft.Win32;
 
 namespace ManageNotepadWindows
 {
-    public partial class NotepadsManager : MaterialForm
+    public partial class NotepadsManager : Form
     {
         // UI font sizing constraints and step
         private const float MinFontSize = 9F;
@@ -37,12 +36,13 @@ namespace ManageNotepadWindows
 
         // Preview and UI
         private RichTextBox textBoxNotepadContent;
-        private Panel panelTop;
-        private Button refresh;
-        private MaterialTextBox2 textBoxSearch;
+        private System.Windows.Forms.Panel panelTop;
+        private AntdUI.Button refresh;
+        private AntdUI.Input textBoxSearch;
+        private AntdUI.Checkbox chkSearchContent;
         private SplitContainer splitContainer1;
-        private Button btnFontIncrease;
-        private Button btnFontDecrease;
+        private AntdUI.Button btnFontIncrease;
+        private AntdUI.Button btnFontDecrease;
 
         // Native helpers (consolidated)
         [DllImport("user32.dll", SetLastError = true)]
@@ -106,11 +106,9 @@ namespace ManageNotepadWindows
             // DPI autoscale
             this.AutoScaleMode = AutoScaleMode.Dpi;
 
-            // MaterialSkin setup
-            var materialSkinManager = MaterialSkinManager.Instance;
-            materialSkinManager.AddFormToManage(this);
-            materialSkinManager.Theme = MaterialSkinManager.Themes.LIGHT;
-            materialSkinManager.ColorScheme = new ColorScheme(Primary.Blue500, Primary.Blue700, Primary.Blue200, Accent.LightBlue200, TextShade.WHITE);
+            // AntdUI window configuration
+            this.MaximizeBox = true;
+            this.MinimizeBox = true;
 
             // Ensure backup dir + restore
             if (!Directory.Exists(backupDir)) Directory.CreateDirectory(backupDir);
@@ -164,7 +162,7 @@ namespace ManageNotepadWindows
                     AutoGenerateColumns = false,
                     MultiSelect = false,
                     ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
-                    ColumnHeadersHeight = 40
+                    ColumnHeadersHeight = 40  // Will be scaled in ApplyDpiScaling
                 };
 
                 var colPid = new DataGridViewTextBoxColumn { Name = "ProcessId", HeaderText = "PID", AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells };
@@ -241,11 +239,18 @@ namespace ManageNotepadWindows
             if (row < 0 || row >= notepadWindows.Count) return;
             var info = notepadWindows[row];
 
-            // Try multiple methods to get content
-            string content = GetNotepadTextModern(info.Hwnd);
-            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("["))
+            // If we already have preview content from search, use it
+            if (!string.IsNullOrWhiteSpace(info.Preview) && !info.Preview.StartsWith("["))
             {
-                content = GetNotepadText(info.Hwnd, -1);
+                textBoxNotepadContent.Text = info.Preview;
+                return;
+            }
+
+            // Try multiple methods to get content - start with the fastest
+            string content = GetNotepadText(info.Hwnd, -1);
+            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("Unable") || content.StartsWith("No content"))
+            {
+                content = GetNotepadTextModern(info.Hwnd);
             }
             if (string.IsNullOrWhiteSpace(content) || content.StartsWith("["))
             {
@@ -422,7 +427,7 @@ namespace ManageNotepadWindows
                 var windowElement = AutomationElement.FromHandle(windowHandle);
                 if (windowElement == null) return "[UIA: window element null]";
 
-                ControlType[] tryTypes = { ControlType.Edit, ControlType.Document, ControlType.Pane, ControlType.Custom, ControlType.Group, ControlType.Text };
+                System.Windows.Automation.ControlType[] tryTypes = { System.Windows.Automation.ControlType.Edit, System.Windows.Automation.ControlType.Document, System.Windows.Automation.ControlType.Pane, System.Windows.Automation.ControlType.Custom, System.Windows.Automation.ControlType.Group, System.Windows.Automation.ControlType.Text };
                 foreach (var ct in tryTypes)
                 {
                     var element = windowElement.FindFirst(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ct));
@@ -447,7 +452,7 @@ namespace ManageNotepadWindows
                     if (!string.IsNullOrWhiteSpace(name)) return name;
                 }
 
-                var textNodes = windowElement.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text));
+                var textNodes = windowElement.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.ControlTypeProperty, System.Windows.Automation.ControlType.Text));
                 if (textNodes != null && textNodes.Count > 0)
                 {
                     var sb = new StringBuilder();
@@ -513,18 +518,30 @@ namespace ManageNotepadWindows
             searchDebounceTimer.Start();
         }
 
-        private void SearchDebounceTimer_Tick(object sender, EventArgs e)
+        private async void SearchDebounceTimer_Tick(object sender, EventArgs e)
         {
             searchDebounceTimer.Stop();
-            PerformSearch();
+            await PerformSearchAsync();
         }
 
-        private void PerformSearch()
+        private async System.Threading.Tasks.Task PerformSearchAsync()
         {
             string searchText = textBoxSearch.Text.ToLower();
-            notepadWindows.Clear();
 
-            EnumWindows((hWnd, lParam) =>
+            // If search is empty, just populate all windows without extracting content
+            if (string.IsNullOrWhiteSpace(searchText))
+            {
+                PopulateNotepadWindows();
+                return;
+            }
+
+            bool searchContent = chkSearchContent?.Checked ?? false;
+
+            var results = await System.Threading.Tasks.Task.Run(() =>
+            {
+                var tempResults = new List<NotepadWindowInfo>();
+
+                EnumWindows((hWnd, lParam) =>
             {
                 try
                 {
@@ -536,29 +553,48 @@ namespace ManageNotepadWindows
                         GetWindowThreadProcessId(hWnd, out uint pid);
                         var title = new StringBuilder(256);
                         GetWindowText(hWnd, title, title.Capacity);
-                        // For search, get full content with fallback methods
-                        string windowContent = GetNotepadText(hWnd, -1);
-                        if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("Unable") || windowContent.StartsWith("No content"))
+
+                        // Always check title first (fast)
+                        if (title.ToString().ToLower().Contains(searchText))
                         {
-                            windowContent = GetNotepadTextModern(hWnd);
+                            tempResults.Add(new NotepadWindowInfo { Hwnd = hWnd, ProcessId = (int)pid, Title = title.ToString(), Preview = "", Diagnostic = "" });
+                            return true;
                         }
-                        if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("["))
+
+                        // Only search content if checkbox is checked
+                        if (searchContent)
                         {
-                            windowContent = TryGetTextFromChildClasses(hWnd);
-                        }
-                        if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("["))
-                        {
-                            windowContent = "[Unable to retrieve content]";
-                        }
-                        if (windowContent.ToLower().Contains(searchText) || title.ToString().ToLower().Contains(searchText))
-                        {
-                            notepadWindows.Add(new NotepadWindowInfo { Hwnd = hWnd, ProcessId = (int)pid, Title = title.ToString(), Preview = windowContent, Diagnostic = windowContent });
+                            // Get full content with fallback methods
+                            string windowContent = GetNotepadText(hWnd, -1);
+                            if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("Unable") || windowContent.StartsWith("No content"))
+                            {
+                                windowContent = GetNotepadTextModern(hWnd);
+                            }
+                            if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("["))
+                            {
+                                windowContent = TryGetTextFromChildClasses(hWnd);
+                            }
+                            if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("["))
+                            {
+                                windowContent = "[Unable to retrieve content]";
+                            }
+                            if (windowContent.ToLower().Contains(searchText))
+                            {
+                                tempResults.Add(new NotepadWindowInfo { Hwnd = hWnd, ProcessId = (int)pid, Title = title.ToString(), Preview = windowContent, Diagnostic = windowContent });
+                            }
                         }
                     }
                 }
                 catch { }
                 return true;
             }, IntPtr.Zero);
+
+                return tempResults;
+            });
+
+            // Update UI on main thread
+            notepadWindows.Clear();
+            notepadWindows.AddRange(results);
 
             // preserve sort
             if (sortColumnIndex != -1) SortByColumn(sortColumnIndex);
@@ -601,17 +637,16 @@ namespace ManageNotepadWindows
             int screenWidth = Screen.PrimaryScreen.WorkingArea.Width;
             int screenHeight = Screen.PrimaryScreen.WorkingArea.Height;
 
-            // Calculate font size for high-DPI displays
-            // With AutoScaleMode.Dpi, we use a consistent point size and Windows handles scaling
+            // Calculate DPI scale factor
             using (Graphics g = this.CreateGraphics())
             {
                 float dpi = g.DpiX;
                 dpiScaleFactor = dpi / 96F;  // 96 DPI = 100%, 192 DPI = 200%, etc.
-
-                // Use 11pt as base - AutoScaleMode.Dpi will scale it appropriately
-                // But the font will appear visually larger on high-DPI screens
                 currentFontSize = 11F;
             }
+
+            // Apply DPI scaling to all controls
+            ApplyDpiScaling();
             UpdateFonts();
 
             this.Width = (int)(screenWidth * 0.8);
@@ -633,6 +668,26 @@ namespace ManageNotepadWindows
         {
             var font = new Font(this.Font.FontFamily, currentFontSize, this.Font.Style);
             SetFontRecursive(this, font);
+        }
+
+        private void ApplyDpiScaling()
+        {
+            // Scale button sizes
+            this.refresh.Size = new Size((int)(150 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
+            this.btnFontIncrease.Size = new Size((int)(130 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
+            this.btnFontDecrease.Size = new Size((int)(130 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
+
+            // Scale panel height
+            this.panelTop.Size = new Size((int)(850 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
+
+            // Scale splitter width
+            this.splitContainer1.SplitterWidth = (int)(16 * dpiScaleFactor);
+
+            // Scale column header height
+            if (gridNotepadWindows != null)
+            {
+                gridNotepadWindows.ColumnHeadersHeight = (int)(40 * dpiScaleFactor);
+            }
         }
 
         // Custom sort handler for virtual DataGridView
@@ -689,13 +744,14 @@ namespace ManageNotepadWindows
         // Minimal InitializeComponent - creates controls used by the class.
         private void InitializeComponent()
         {
-            this.refresh = new Button();
-            this.btnFontIncrease = new Button();
-            this.btnFontDecrease = new Button();
-            this.textBoxSearch = new MaterialTextBox2();
+            this.refresh = new AntdUI.Button();
+            this.btnFontIncrease = new AntdUI.Button();
+            this.btnFontDecrease = new AntdUI.Button();
+            this.textBoxSearch = new AntdUI.Input();
+            this.chkSearchContent = new AntdUI.Checkbox();
             this.splitContainer1 = new SplitContainer();
             this.textBoxNotepadContent = new RichTextBox();
-            this.panelTop = new Panel();
+            this.panelTop = new System.Windows.Forms.Panel();
 
             ((System.ComponentModel.ISupportInitialize)(this.splitContainer1)).BeginInit();
             this.splitContainer1.Panel1.SuspendLayout();
@@ -723,16 +779,31 @@ namespace ManageNotepadWindows
 
             // textBoxSearch
             this.textBoxSearch.Dock = DockStyle.Fill;
-            this.textBoxSearch.Hint = "Search...";
-            this.textBoxSearch.TrailingIconClick += new EventHandler(this.ClearSearchBox);
+            this.textBoxSearch.PlaceholderText = "Search titles...";
+            this.textBoxSearch.AllowClear = true;
             this.textBoxSearch.TextChanged += new EventHandler(this.TextBoxSearch_TextChanged);
+
+            // chkSearchContent
+            this.chkSearchContent.Dock = DockStyle.Right;
+            this.chkSearchContent.Text = "Search content";
+            this.chkSearchContent.AutoSize = true;
+            this.chkSearchContent.CheckedChanged += (s, e) =>
+            {
+                this.textBoxSearch.PlaceholderText = chkSearchContent.Checked ? "Search titles and content..." : "Search titles...";
+                if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                {
+                    searchDebounceTimer.Stop();
+                    searchDebounceTimer.Start();
+                }
+            };
 
             // splitContainer1
             this.splitContainer1.Dock = DockStyle.Fill;
             this.splitContainer1.Location = new Point(0, 70);
             this.splitContainer1.Size = new Size(850, 507);
             this.splitContainer1.SplitterDistance = 350;
-            this.splitContainer1.SplitterWidth = 8;
+            this.splitContainer1.SplitterWidth = 16;
+            this.splitContainer1.BorderStyle = BorderStyle.Fixed3D;
             this.splitContainer1.Panel2.Controls.Add(this.textBoxNotepadContent);
 
             // textBoxNotepadContent
@@ -744,6 +815,7 @@ namespace ManageNotepadWindows
             this.panelTop.Dock = DockStyle.Top;
             this.panelTop.Size = new Size(850, 70);
             this.panelTop.Controls.Add(this.textBoxSearch);
+            this.panelTop.Controls.Add(this.chkSearchContent);
             this.panelTop.Controls.Add(this.btnFontDecrease);
             this.panelTop.Controls.Add(this.btnFontIncrease);
             this.panelTop.Controls.Add(this.refresh);
