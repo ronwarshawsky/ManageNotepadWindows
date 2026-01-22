@@ -22,6 +22,7 @@ namespace ManageNotepadWindows
         private const float FontStep = 1F;
 
         private float currentFontSize = 11F;
+        private float dpiScaleFactor = 1F;
 
         // Sorting state for DataGridView (virtual mode)
         private int sortColumnIndex = -1;
@@ -161,21 +162,19 @@ namespace ManageNotepadWindows
                     AllowUserToResizeRows = false,
                     AllowUserToOrderColumns = true,
                     AutoGenerateColumns = false,
-                    MultiSelect = false
+                    MultiSelect = false,
+                    ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
+                    ColumnHeadersHeight = 40
                 };
 
-                var colPid = new DataGridViewTextBoxColumn { Name = "ProcessId", HeaderText = "PID", Width = 90 };
+                var colPid = new DataGridViewTextBoxColumn { Name = "ProcessId", HeaderText = "PID", AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells };
                 var colName = new DataGridViewTextBoxColumn { Name = "Name", HeaderText = "Name", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill };
-                var colPreview = new DataGridViewTextBoxColumn { Name = "Preview", HeaderText = "Text Preview", Width = 400 };
-                var colDiag = new DataGridViewTextBoxColumn { Name = "Diag", HeaderText = "Diag", Width = 220 };
 
                 // Make columns programmatic-sortable (virtual mode requires custom sorting)
                 colPid.SortMode = DataGridViewColumnSortMode.Programmatic;
                 colName.SortMode = DataGridViewColumnSortMode.Programmatic;
-                colPreview.SortMode = DataGridViewColumnSortMode.Programmatic;
-                colDiag.SortMode = DataGridViewColumnSortMode.Programmatic;
 
-                gridNotepadWindows.Columns.AddRange(new DataGridViewColumn[] { colPid, colName, colPreview, colDiag });
+                gridNotepadWindows.Columns.AddRange(new DataGridViewColumn[] { colPid, colName });
 
                 gridNotepadWindows.CellValueNeeded += GridNotepadWindows_CellValueNeeded;
                 gridNotepadWindows.CellDoubleClick += GridNotepadWindows_CellDoubleClick;
@@ -183,6 +182,12 @@ namespace ManageNotepadWindows
 
                 // hook header click for sorting
                 gridNotepadWindows.ColumnHeaderMouseClick += GridNotepadWindows_ColumnHeaderMouseClick;
+
+                // ensure double-click anywhere on a row (including empty cell areas or row header) brings the notepad window up
+                gridNotepadWindows.MouseDoubleClick += GridNotepadWindows_MouseDoubleClick;
+
+                // ensure double-click anywhere on a row (including empty cell areas or row header) brings the notepad window up
+                gridNotepadWindows.MouseDoubleClick += GridNotepadWindows_MouseDoubleClick;
             }
 
             if (splitContainer1 != null)
@@ -201,12 +206,6 @@ namespace ManageNotepadWindows
             {
                 case "ProcessId": e.Value = item.ProcessId.ToString(); break;
                 case "Name": e.Value = item.Title; break;
-                case "Preview":
-                    var p = item.Preview?.Replace(Environment.NewLine, " ").Trim();
-                    if (!string.IsNullOrEmpty(p) && p.Length > 200) p = p.Substring(0, 200) + "...";
-                    e.Value = p;
-                    break;
-                case "Diag": e.Value = item.Diagnostic?.Replace(Environment.NewLine, " ").Trim(); break;
             }
         }
 
@@ -219,15 +218,44 @@ namespace ManageNotepadWindows
             if (hwnd != IntPtr.Zero) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
         }
 
+        private void GridNotepadWindows_MouseDoubleClick(object sender, MouseEventArgs e)
+        {
+            if (gridNotepadWindows == null) return;
+            var hit = gridNotepadWindows.HitTest(e.X, e.Y);
+            int rowIndex = hit.RowIndex;
+            if (rowIndex < 0 || rowIndex >= notepadWindows.Count) return;
+            var item = notepadWindows[rowIndex];
+            IntPtr hwnd = item.Hwnd;
+            if (hwnd == IntPtr.Zero && item.ProcessId != 0) hwnd = FindWindowForProcess(item.ProcessId);
+            if (hwnd != IntPtr.Zero)
+            {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
+
         private void GridNotepadWindows_SelectionChanged(object sender, EventArgs e)
         {
             if (gridNotepadWindows.CurrentCell == null) { textBoxNotepadContent.Text = string.Empty; return; }
             int row = gridNotepadWindows.CurrentCell.RowIndex;
             if (row < 0 || row >= notepadWindows.Count) return;
             var info = notepadWindows[row];
+
+            // Try multiple methods to get content
             string content = GetNotepadTextModern(info.Hwnd);
-            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("[")) content = GetNotepadText(info.Hwnd, -1);
-            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("Unable") || content.StartsWith("No content")) content = "Preview not available";
+            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("["))
+            {
+                content = GetNotepadText(info.Hwnd, -1);
+            }
+            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("["))
+            {
+                content = TryGetTextFromChildClasses(info.Hwnd);
+            }
+            if (string.IsNullOrWhiteSpace(content) || content.StartsWith("Unable") || content.StartsWith("No content") || content.StartsWith("["))
+            {
+                content = "Preview not available";
+            }
+
             textBoxNotepadContent.Text = content;
         }
 
@@ -252,20 +280,14 @@ namespace ManageNotepadWindows
                         StringBuilder title = new StringBuilder(256);
                         GetWindowText(hWnd, title, title.Capacity);
 
-                        string preview = GetNotepadTextModern(hWnd);
-                        bool modernFailed = string.IsNullOrWhiteSpace(preview) || preview.StartsWith("[");
-                        if (modernFailed) preview = GetNotepadText(hWnd, 5);
-
-                        string diag = preview;
-                        if (string.IsNullOrWhiteSpace(preview) || preview.StartsWith("Unable") || preview.StartsWith("No content")) preview = "[Unable to retrieve content]";
-
+                        // No preview during initial load - keep it fast
                         notepadWindows.Add(new NotepadWindowInfo
                         {
                             Hwnd = hWnd,
                             ProcessId = (int)pid,
                             Title = title.ToString(),
-                            Preview = preview,
-                            Diagnostic = diag
+                            Preview = "",
+                            Diagnostic = ""
                         });
                     }
                 }
@@ -514,11 +536,20 @@ namespace ManageNotepadWindows
                         GetWindowThreadProcessId(hWnd, out uint pid);
                         var title = new StringBuilder(256);
                         GetWindowText(hWnd, title, title.Capacity);
-                        string windowContent = GetNotepadTextModern(hWnd);
-                        bool modernFailed = string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("[");
-                        if (modernFailed) windowContent = GetNotepadText(hWnd, 5);
+                        // For search, get full content with fallback methods
+                        string windowContent = GetNotepadText(hWnd, -1);
                         if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("Unable") || windowContent.StartsWith("No content"))
+                        {
+                            windowContent = GetNotepadTextModern(hWnd);
+                        }
+                        if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("["))
+                        {
+                            windowContent = TryGetTextFromChildClasses(hWnd);
+                        }
+                        if (string.IsNullOrWhiteSpace(windowContent) || windowContent.StartsWith("["))
+                        {
                             windowContent = "[Unable to retrieve content]";
+                        }
                         if (windowContent.ToLower().Contains(searchText) || title.ToString().ToLower().Contains(searchText))
                         {
                             notepadWindows.Add(new NotepadWindowInfo { Hwnd = hWnd, ProcessId = (int)pid, Title = title.ToString(), Preview = windowContent, Diagnostic = windowContent });
@@ -542,19 +573,53 @@ namespace ManageNotepadWindows
             }
         }
 
-        private void btnRefresh_Click(object sender, EventArgs e) => PopulateNotepadWindows();
-        private void btnFontIncrease_Click(object sender, EventArgs e) { currentFontSize = Math.Min(48F, currentFontSize + 2F);                             UpdateFonts(); }
-        private void btnFontDecrease_Click(object sender, EventArgs e) { currentFontSize = Math.Max(8F, currentFontSize - 2F); UpdateFonts(); }
+        private async void btnRefresh_Click(object sender, EventArgs e)
+        {
+            textBoxSearch.Text = string.Empty;
+            refresh.Enabled = false;
+            refresh.Text = "Refreshing...";
+
+            await System.Threading.Tasks.Task.Run(() => PopulateNotepadWindows());
+
+            refresh.Enabled = true;
+            refresh.Text = "Refresh";
+        }
+        private void btnFontIncrease_Click(object sender, EventArgs e)
+        {
+            currentFontSize = Math.Min(MaxFontSize, currentFontSize + FontStep);
+            UpdateFonts();
+        }
+        private void btnFontDecrease_Click(object sender, EventArgs e)
+        {
+            currentFontSize = Math.Max(MinFontSize, currentFontSize - FontStep);
+            UpdateFonts();
+        }
 
         private void NotepadsManager_Load(object sender, EventArgs e)
         {
             try { this.Icon = ManageCMDWindows.Properties.Resources.notepad_manager_icon; } catch { }
             int screenWidth = Screen.PrimaryScreen.WorkingArea.Width;
             int screenHeight = Screen.PrimaryScreen.WorkingArea.Height;
+
+            // Calculate font size for high-DPI displays
+            // With AutoScaleMode.Dpi, we use a consistent point size and Windows handles scaling
+            using (Graphics g = this.CreateGraphics())
+            {
+                float dpi = g.DpiX;
+                dpiScaleFactor = dpi / 96F;  // 96 DPI = 100%, 192 DPI = 200%, etc.
+
+                // Use 11pt as base - AutoScaleMode.Dpi will scale it appropriately
+                // But the font will appear visually larger on high-DPI screens
+                currentFontSize = 11F;
+            }
+            UpdateFonts();
+
             this.Width = (int)(screenWidth * 0.8);
             this.Height = (int)(screenHeight * 0.7);
             this.StartPosition = FormStartPosition.CenterScreen;
-            if (splitContainer1 != null) splitContainer1.SplitterDistance = (int)(splitContainer1.Width * 0.4);
+            if (splitContainer1 != null) splitContainer1.SplitterDistance = (int)(splitContainer1.Width * 0.75);
+
+            // Load windows synchronously but quickly (no preview text extraction)
             PopulateNotepadWindows();
         }
 
@@ -607,12 +672,6 @@ namespace ManageNotepadWindows
                 case "Name":
                     sorted = sortAscending ? notepadWindows.OrderBy(n => n.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : notepadWindows.OrderByDescending(n => n.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
                     break;
-                case "Preview":
-                    sorted = sortAscending ? notepadWindows.OrderBy(n => n.Preview ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : notepadWindows.OrderByDescending(n => n.Preview ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
-                    break;
-                case "Diag":
-                    sorted = sortAscending ? notepadWindows.OrderBy(n => n.Diagnostic ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : notepadWindows.OrderByDescending(n => n.Diagnostic ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
-                    break;
                 default:
                     return;
             }
@@ -646,19 +705,19 @@ namespace ManageNotepadWindows
 
             // refresh
             this.refresh.Dock = DockStyle.Left;
-            this.refresh.Size = new Size(120, 70);
+            this.refresh.Size = new Size(150, 70);
             this.refresh.Text = "Refresh";
             this.refresh.Click += new EventHandler(this.btnRefresh_Click);
 
             // btnFontIncrease
             this.btnFontIncrease.Dock = DockStyle.Right;
-            this.btnFontIncrease.Size = new Size(100, 70);
+            this.btnFontIncrease.Size = new Size(130, 70);
             this.btnFontIncrease.Text = "Zoom +";
             this.btnFontIncrease.Click += new EventHandler(this.btnFontIncrease_Click);
 
             // btnFontDecrease
             this.btnFontDecrease.Dock = DockStyle.Right;
-            this.btnFontDecrease.Size = new Size(100, 70);
+            this.btnFontDecrease.Size = new Size(130, 70);
             this.btnFontDecrease.Text = "Zoom -";
             this.btnFontDecrease.Click += new EventHandler(this.btnFontDecrease_Click);
 
@@ -673,6 +732,7 @@ namespace ManageNotepadWindows
             this.splitContainer1.Location = new Point(0, 70);
             this.splitContainer1.Size = new Size(850, 507);
             this.splitContainer1.SplitterDistance = 350;
+            this.splitContainer1.SplitterWidth = 8;
             this.splitContainer1.Panel2.Controls.Add(this.textBoxNotepadContent);
 
             // textBoxNotepadContent
