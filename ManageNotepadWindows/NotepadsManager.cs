@@ -142,6 +142,7 @@ namespace ManageNotepadWindows
 
             // Behavior
             SetupGrid();
+            SetupBrowserGrid();
             MakeWindowTopMost();
             this.Load += NotepadsManager_Load;
 
@@ -213,6 +214,50 @@ namespace ManageNotepadWindows
             }
         }
 
+        private void SetupBrowserGrid()
+        {
+            if (gridBrowserTabs == null)
+            {
+                gridBrowserTabs = new DataGridView
+                {
+                    Dock = DockStyle.Fill,
+                    ReadOnly = true,
+                    AllowUserToAddRows = false,
+                    AllowUserToDeleteRows = false,
+                    SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                    VirtualMode = true,
+                    RowHeadersVisible = false,
+                    AllowUserToResizeRows = false,
+                    AllowUserToOrderColumns = true,
+                    AutoGenerateColumns = false,
+                    MultiSelect = false,
+                    ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize,
+                    ColumnHeadersHeight = 40
+                };
+
+                var colPid = new DataGridViewTextBoxColumn { Name = "ProcessId", HeaderText = "PID", AutoSizeMode = DataGridViewAutoSizeColumnMode.AllCells };
+                var colTitle = new DataGridViewTextBoxColumn { Name = "Title", HeaderText = "Title", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill };
+                var colUrl = new DataGridViewTextBoxColumn { Name = "Url", HeaderText = "URL", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill };
+
+                colPid.SortMode = DataGridViewColumnSortMode.Programmatic;
+                colTitle.SortMode = DataGridViewColumnSortMode.Programmatic;
+                colUrl.SortMode = DataGridViewColumnSortMode.Programmatic;
+
+                gridBrowserTabs.Columns.AddRange(new DataGridViewColumn[] { colPid, colTitle, colUrl });
+
+                gridBrowserTabs.CellValueNeeded += GridBrowserTabs_CellValueNeeded;
+                gridBrowserTabs.CellDoubleClick += GridBrowserTabs_CellDoubleClick;
+                gridBrowserTabs.SelectionChanged += GridBrowserTabs_SelectionChanged;
+                gridBrowserTabs.MouseDoubleClick += GridBrowserTabs_MouseDoubleClick;
+            }
+
+            if (splitContainerBrowser != null)
+            {
+                splitContainerBrowser.Panel1.Controls.Clear();
+                splitContainerBrowser.Panel1.Controls.Add(gridBrowserTabs);
+            }
+        }
+
         private void GridNotepadWindows_CellValueNeeded(object sender, DataGridViewCellValueEventArgs e)
         {
             if (e.RowIndex < 0 || e.RowIndex >= notepadWindows.Count) return;
@@ -223,6 +268,66 @@ namespace ManageNotepadWindows
                 case "ProcessId": e.Value = item.ProcessId.ToString(); break;
                 case "Name": e.Value = item.Title; break;
             }
+        }
+
+        private void GridBrowserTabs_CellValueNeeded(object sender, DataGridViewCellValueEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= browserTabs.Count) return;
+            var item = browserTabs[e.RowIndex];
+            var colName = gridBrowserTabs.Columns[e.ColumnIndex].Name;
+            switch (colName)
+            {
+                case "ProcessId": e.Value = item.ProcessId.ToString(); break;
+                case "Title": e.Value = item.Title; break;
+                case "Url": e.Value = item.Url ?? ""; break;
+            }
+        }
+
+        private void GridBrowserTabs_CellDoubleClick(object sender, DataGridViewCellEventArgs e)
+        {
+            if (e.RowIndex < 0 || e.RowIndex >= browserTabs.Count) return;
+            var item = browserTabs[e.RowIndex];
+            IntPtr hwnd = item.Hwnd;
+            if (hwnd != IntPtr.Zero) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
+        }
+
+        private void GridBrowserTabs_MouseDoubleClick(object sender, MouseEventArgs e)
+        {
+            if (gridBrowserTabs == null) return;
+            var hit = gridBrowserTabs.HitTest(e.X, e.Y);
+            int rowIndex = hit.RowIndex;
+            if (rowIndex < 0 || rowIndex >= browserTabs.Count) return;
+            var item = browserTabs[rowIndex];
+            IntPtr hwnd = item.Hwnd;
+            if (hwnd != IntPtr.Zero)
+            {
+                ShowWindow(hwnd, SW_RESTORE);
+                SetForegroundWindow(hwnd);
+            }
+        }
+
+        private void GridBrowserTabs_SelectionChanged(object sender, EventArgs e)
+        {
+            if (gridBrowserTabs.CurrentCell == null) { textBoxBrowserContent.Text = string.Empty; return; }
+            int row = gridBrowserTabs.CurrentCell.RowIndex;
+            if (row < 0 || row >= browserTabs.Count) return;
+            var info = browserTabs[row];
+
+            // Display tab info
+            var sb = new StringBuilder();
+            sb.AppendLine($"Title: {info.Title}");
+            sb.AppendLine($"URL: {info.Url ?? "Unknown"}");
+            sb.AppendLine($"PID: {info.ProcessId}");
+            sb.AppendLine($"Window Handle: 0x{info.Hwnd.ToString("X")}");
+
+            if (!string.IsNullOrWhiteSpace(info.Preview))
+            {
+                sb.AppendLine();
+                sb.AppendLine("Preview:");
+                sb.AppendLine(info.Preview);
+            }
+
+            textBoxBrowserContent.Text = sb.ToString();
         }
 
         private void GridNotepadWindows_CellDoubleClick(object sender, DataGridViewCellEventArgs e)
@@ -328,6 +433,115 @@ namespace ManageNotepadWindows
                     gridNotepadWindows.Invalidate();
                 }
             }
+        }
+
+        private void PopulateBrowserTabs()
+        {
+            browserTabs.Clear();
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                try
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+
+                    StringBuilder className = new StringBuilder(256);
+                    GetClassName(hWnd, className, className.Capacity);
+                    var cls = className.ToString();
+
+                    // Chrome, Edge, Brave use Chrome_WidgetWin_1
+                    // Firefox uses MozillaWindowClass
+                    if (cls == "Chrome_WidgetWin_1" || cls == "MozillaWindowClass")
+                    {
+                        GetWindowThreadProcessId(hWnd, out uint pid);
+
+                        StringBuilder title = new StringBuilder(256);
+                        GetWindowText(hWnd, title, title.Capacity);
+
+                        // Skip windows with no title or browser window titles
+                        string titleStr = title.ToString();
+                        if (string.IsNullOrWhiteSpace(titleStr)) return true;
+
+                        // Try to extract URL from UI Automation
+                        string url = ExtractBrowserUrl(hWnd);
+
+                        browserTabs.Add(new BrowserTabInfo
+                        {
+                            Hwnd = hWnd,
+                            ProcessId = (int)pid,
+                            Title = titleStr,
+                            Url = url,
+                            Preview = ""
+                        });
+                    }
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+
+            if (gridBrowserTabs != null)
+            {
+                gridBrowserTabs.RowCount = browserTabs.Count;
+                gridBrowserTabs.Invalidate();
+            }
+        }
+
+        private string ExtractBrowserUrl(IntPtr windowHandle)
+        {
+            try
+            {
+                var windowElement = AutomationElement.FromHandle(windowHandle);
+                if (windowElement == null) return "";
+
+                // Look for address bar (Edit control with automation ID containing "address" or "url")
+                var condition = new AndCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, System.Windows.Automation.ControlType.Edit),
+                    new OrCondition(
+                        new PropertyCondition(AutomationElement.AutomationIdProperty, "addressbar"),
+                        new PropertyCondition(AutomationElement.NameProperty, "Address and search bar")
+                    )
+                );
+
+                var addressBar = windowElement.FindFirst(TreeScope.Descendants, condition);
+                if (addressBar != null)
+                {
+                    object patternObj;
+                    if (addressBar.TryGetCurrentPattern(ValuePattern.Pattern, out patternObj))
+                    {
+                        var valuePattern = (ValuePattern)patternObj;
+                        return valuePattern.Current.Value;
+                    }
+                }
+
+                // Fallback: try to find any Edit control that looks like a URL
+                var editCondition = new PropertyCondition(AutomationElement.ControlTypeProperty, System.Windows.Automation.ControlType.Edit);
+                var edits = windowElement.FindAll(TreeScope.Descendants, editCondition);
+
+                for (int i = 0; i < edits.Count; i++)
+                {
+                    try
+                    {
+                        object patternObj;
+                        if (edits[i].TryGetCurrentPattern(ValuePattern.Pattern, out patternObj))
+                        {
+                            var valuePattern = (ValuePattern)patternObj;
+                            var value = valuePattern.Current.Value;
+
+                            // Check if it looks like a URL
+                            if (!string.IsNullOrWhiteSpace(value) &&
+                                (value.StartsWith("http://") || value.StartsWith("https://") ||
+                                 value.StartsWith("file://") || value.Contains(".")))
+                            {
+                                return value;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            return "";
         }
 
         private void OnSessionEnding(object sender, SessionEndingEventArgs e) => BackupUnsavedNotepadContent();
@@ -633,7 +847,17 @@ namespace ManageNotepadWindows
             refresh.Enabled = false;
             refresh.Text = "Refreshing...";
 
-            await System.Threading.Tasks.Task.Run(() => PopulateNotepadWindows());
+            // Check which tab is active and refresh accordingly
+            if (tabControl != null && tabControl.SelectedIndex == 0)
+            {
+                // Notepads tab
+                await System.Threading.Tasks.Task.Run(() => PopulateNotepadWindows());
+            }
+            else if (tabControl != null && tabControl.SelectedIndex == 1)
+            {
+                // Browser Tabs tab
+                await System.Threading.Tasks.Task.Run(() => PopulateBrowserTabs());
+            }
 
             refresh.Enabled = true;
             refresh.Text = "Refresh";
@@ -671,9 +895,11 @@ namespace ManageNotepadWindows
             this.Height = (int)(screenHeight * 0.7);
             this.StartPosition = FormStartPosition.CenterScreen;
             if (splitContainer1 != null) splitContainer1.SplitterDistance = (int)(splitContainer1.Width * 0.75);
+            if (splitContainerBrowser != null) splitContainerBrowser.SplitterDistance = (int)(splitContainerBrowser.Width * 0.75);
 
             // Load windows synchronously but quickly (no preview text extraction)
             PopulateNotepadWindows();
+            PopulateBrowserTabs();
         }
 
         private void SetFontRecursive(Control control, Font font)
@@ -700,11 +926,16 @@ namespace ManageNotepadWindows
 
             // Scale splitter width
             this.splitContainer1.SplitterWidth = (int)(16 * dpiScaleFactor);
+            this.splitContainerBrowser.SplitterWidth = (int)(16 * dpiScaleFactor);
 
             // Scale column header height
             if (gridNotepadWindows != null)
             {
                 gridNotepadWindows.ColumnHeadersHeight = (int)(40 * dpiScaleFactor);
+            }
+            if (gridBrowserTabs != null)
+            {
+                gridBrowserTabs.ColumnHeadersHeight = (int)(40 * dpiScaleFactor);
             }
         }
 
