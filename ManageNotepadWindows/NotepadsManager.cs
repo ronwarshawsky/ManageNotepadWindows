@@ -90,6 +90,13 @@ namespace ManageNotepadWindows
         private const int HistoryColBrowserWidth = 70;
         private const int HistoryColLastVisitWidth = 130;
 
+        // Notepad Tab Cache (Win11 TabState)
+        private AntdUI.Table tableTabState;
+        private List<TabStateInfo> tabStateFiles = new List<TabStateInfo>();
+        private SplitContainer splitContainerTabState;
+        private RichTextBox textBoxTabStateContent;
+        private int selectedTabStateIndex = -1;
+
         // Status bar
         private AntdUI.Panel panelStatus;
         private AntdUI.Label labelStatus;
@@ -97,6 +104,7 @@ namespace ManageNotepadWindows
         private int totalBrowserCount = 0;
         private int totalShellCount = 0;
         private int totalHistoryCount = 0;
+        private int totalTabStateCount = 0;
 
         // Native helpers (consolidated)
         [DllImport("user32.dll", SetLastError = true)]
@@ -260,6 +268,17 @@ namespace ManageNotepadWindows
             public string LastVisitFormatted => LastVisit.ToString("yyyy-MM-dd HH:mm");
         }
 
+        private class TabStateInfo : AntdUI.NotifyProperty
+        {
+            public string FileName { get; set; }
+            public string FilePath { get; set; }
+            public string Content { get; set; }
+            public int ContentLength { get; set; }
+            public DateTime LastModified { get; set; }
+            public string Preview { get; set; }
+            public string LastModifiedFormatted => LastModified.ToString("MM/dd/yy HH:mm");
+        }
+
         // Settings for persistence
         private class AppSettings
         {
@@ -301,6 +320,7 @@ namespace ManageNotepadWindows
             SetupBrowserGrid();
             SetupShellsGrid();
             SetupHistoryGrid();
+            SetupTabStateGrid();
             MakeWindowTopMost();
             // Load event is registered in InitializeComponent
             this.FormClosing += NotepadsManager_FormClosing;
@@ -477,6 +497,151 @@ namespace ManageNotepadWindows
                 splitContainerHistory.Panel1.Controls.Clear();
                 splitContainerHistory.Panel1.Controls.Add(tableHistory);
             }
+        }
+
+        private void SetupTabStateGrid()
+        {
+            if (tableTabState == null)
+            {
+                tableTabState = new AntdUI.Table
+                {
+                    Dock = DockStyle.Fill,
+                    Radius = 6,
+                    FixedHeader = true,
+                    EnableHeaderResizing = true,
+                    RowSelectedBg = Color.FromArgb(230, 247, 255),
+                    RowSelectedFore = Color.Black,
+                    BorderColor = Color.FromArgb(217, 217, 217),
+                    EmptyText = "No cached Notepad tabs found"
+                };
+                tableTabState.Columns.Add(new AntdUI.Column("LastModifiedFormatted", "Modified") { Width = "120", SortOrder = true });
+                tableTabState.Columns.Add(new AntdUI.Column("ContentLength", "Chars") { Width = "60", SortOrder = true });
+                tableTabState.Columns.Add(new AntdUI.Column("Preview", "Content Preview") { Width = "fill", Ellipsis = true });
+                tableTabState.CellClick += TableTabState_CellClick;
+                tableTabState.CellDoubleClick += TableTabState_CellDoubleClick;
+                tableTabState.SelectIndexChanged += TableTabState_SelectIndexChanged;
+            }
+
+            if (splitContainerTabState != null)
+            {
+                splitContainerTabState.Panel1.Controls.Clear();
+                splitContainerTabState.Panel1.Controls.Add(tableTabState);
+            }
+        }
+
+        private void PopulateTabState()
+        {
+            var tabStateDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Packages", "Microsoft.WindowsNotepad_8wekyb3d8bbwe", "LocalState", "TabState");
+
+            tabStateFiles.Clear();
+            if (!Directory.Exists(tabStateDir)) return;
+
+            var files = Directory.GetFiles(tabStateDir, "*.bin")
+                .Where(f => !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(f), @"\.\d+\.bin(\.tmp)?$"))
+                .OrderByDescending(File.GetLastWriteTime);
+
+            foreach (var file in files)
+            {
+                var info = ParseTabStateFile(file);
+                if (info != null) tabStateFiles.Add(info);
+            }
+            totalTabStateCount = tabStateFiles.Count;
+        }
+
+        private static TabStateInfo ParseTabStateFile(string path)
+        {
+            try
+            {
+                byte[] bytes;
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                {
+                    bytes = new byte[fs.Length];
+                    fs.ReadExactly(bytes, 0, bytes.Length);
+                }
+
+                if (bytes.Length < 6 || bytes[0] != 0x4E || bytes[1] != 0x50) return null;
+                if (bytes[3] != 0x00) return null; // saved file — content is on disk
+
+                // Find the fixed content marker 03 01 01 01
+                int marker = -1;
+                for (int i = 4; i < bytes.Length - 4; i++)
+                    if (bytes[i] == 0x03 && bytes[i + 1] == 0x01 && bytes[i + 2] == 0x01 && bytes[i + 3] == 0x01) { marker = i; break; }
+                if (marker < 0) return null;
+
+                int pos = marker + 4;
+                int contentLen = ReadTabStateVarint(bytes, ref pos);
+                if (contentLen <= 0 || pos + contentLen * 2 > bytes.Length) return null;
+
+                string content = Encoding.Unicode.GetString(bytes, pos, contentLen * 2);
+                string preview = content.Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ");
+                if (preview.Length > 150) preview = preview.Substring(0, 150) + "…";
+
+                return new TabStateInfo
+                {
+                    FileName = Path.GetFileNameWithoutExtension(path),
+                    FilePath = path,
+                    Content = content,
+                    ContentLength = contentLen,
+                    LastModified = File.GetLastWriteTime(path),
+                    Preview = preview
+                };
+            }
+            catch { return null; }
+        }
+
+        private static int ReadTabStateVarint(byte[] bytes, ref int pos)
+        {
+            int val = 0, shift = 0;
+            byte b;
+            do { b = bytes[pos++]; val |= (b & 0x7F) << shift; shift += 7; }
+            while ((b & 0x80) != 0 && pos < bytes.Length);
+            return val;
+        }
+
+        private void RefreshTabStateTable()
+        {
+            if (tableTabState == null) return;
+            tableTabState.DataSource = null;
+            tableTabState.DataSource = new List<TabStateInfo>(tabStateFiles);
+        }
+
+        private void TableTabState_SelectIndexChanged(object sender, EventArgs e)
+        {
+            int idx = tableTabState?.SelectedIndex ?? -1;
+            if (idx > 0)
+            {
+                selectedTabStateIndex = idx - 1;
+                if (selectedTabStateIndex < tabStateFiles.Count)
+                    textBoxTabStateContent.Text = tabStateFiles[selectedTabStateIndex].Content ?? string.Empty;
+            }
+        }
+
+        private void TableTabState_CellClick(object sender, AntdUI.TableClickEventArgs e) { }
+
+        private void TableTabState_CellDoubleClick(object sender, AntdUI.TableClickEventArgs e)
+        {
+            if (e.Record is TabStateInfo item) RestoreTabState(item);
+        }
+
+        private void RestoreTabState(TabStateInfo item)
+        {
+            if (string.IsNullOrWhiteSpace(item?.Content)) return;
+            try
+            {
+                var notepad = Process.Start("notepad.exe");
+                if (notepad == null || !notepad.WaitForInputIdle(5000)) return;
+                IntPtr hwnd = IntPtr.Zero;
+                for (int i = 0; i < 10 && hwnd == IntPtr.Zero; i++)
+                {
+                    System.Threading.Thread.Sleep(200);
+                    notepad.Refresh();
+                    hwnd = notepad.MainWindowHandle;
+                }
+                if (hwnd != IntPtr.Zero) TrySetNotepadText(hwnd, item.Content);
+            }
+            catch (Exception ex) { Debug.WriteLine($"RestoreTabState error: {ex.Message}"); }
         }
 
         // Track selected row indices for AntdUI.Table
@@ -2666,6 +2831,12 @@ namespace ManageNotepadWindows
                     await PerformHistorySearchAsync();
                 RefreshHistoryTable();
             }
+            else if (tabs != null && tabs.SelectedIndex == 4)
+            {
+                // Notepad Cache tab - reload from TabState directory
+                await System.Threading.Tasks.Task.Run(() => PopulateTabState());
+                RefreshTabStateTable();
+            }
 
             refresh.Enabled = true;
             refresh.Text = "Refresh";
@@ -2782,6 +2953,11 @@ namespace ManageNotepadWindows
                     labelStatus.Text = $"{browserHistory.Count} history entr{(browserHistory.Count != 1 ? "ies" : "y")}";
                 else
                     labelStatus.Text = $"{browserHistory.Count} of {totalHistoryCount} history entries";
+            }
+            else if (tabs != null && tabs.SelectedIndex == 4)
+            {
+                // Notepad Cache tab
+                labelStatus.Text = $"{tabStateFiles.Count} cached Notepad tab{(tabStateFiles.Count != 1 ? "s" : "")} (Win11 TabState)";
             }
             else
             {
@@ -3177,6 +3353,8 @@ namespace ManageNotepadWindows
             this.panelShellPreview = new AntdUI.Panel();
             this.splitContainerHistory = new SplitContainer();
             this.textBoxHistoryDetails = new RichTextBox();
+            this.splitContainerTabState = new SplitContainer();
+            this.textBoxTabStateContent = new RichTextBox();
             this.panelStatus = new AntdUI.Panel();
             this.labelStatus = new AntdUI.Label();
 
@@ -3193,6 +3371,9 @@ namespace ManageNotepadWindows
             ((System.ComponentModel.ISupportInitialize)(this.splitContainerHistory)).BeginInit();
             this.splitContainerHistory.Panel2.SuspendLayout();
             this.splitContainerHistory.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerTabState)).BeginInit();
+            this.splitContainerTabState.Panel2.SuspendLayout();
+            this.splitContainerTabState.SuspendLayout();
             this.panelTop.SuspendLayout();
 
             // refresh - styled AntdUI button with icon
@@ -3334,6 +3515,38 @@ namespace ManageNotepadWindows
             this.textBoxHistoryDetails.BorderStyle = BorderStyle.None;
             this.textBoxHistoryDetails.Text = "Select a history entry to see details...";
 
+            // splitContainerTabState (Notepad Cache tab)
+            this.splitContainerTabState.Dock = DockStyle.Fill;
+            this.splitContainerTabState.Orientation = Orientation.Horizontal;
+            this.splitContainerTabState.SplitterDistance = 300;
+            this.splitContainerTabState.SplitterWidth = 6;
+            this.splitContainerTabState.BorderStyle = BorderStyle.None;
+
+            // textBoxTabStateContent - preview pane
+            this.textBoxTabStateContent.Dock = DockStyle.Fill;
+            this.textBoxTabStateContent.ReadOnly = true;
+            this.textBoxTabStateContent.ScrollBars = RichTextBoxScrollBars.Both;
+            this.textBoxTabStateContent.BorderStyle = BorderStyle.None;
+            this.textBoxTabStateContent.Font = new Font("Consolas", 9f);
+            this.textBoxTabStateContent.WordWrap = false;
+            this.textBoxTabStateContent.Text = "Select a tab to preview content. Double-click to open in Notepad.";
+
+            // Restore button below preview
+            var btnRestoreTab = new AntdUI.Button();
+            btnRestoreTab.Dock = DockStyle.Bottom;
+            btnRestoreTab.Height = 36;
+            btnRestoreTab.Text = "Open in Notepad";
+            btnRestoreTab.Type = AntdUI.TTypeMini.Primary;
+            btnRestoreTab.Radius = 6;
+            btnRestoreTab.Click += (s, e) =>
+            {
+                if (selectedTabStateIndex >= 0 && selectedTabStateIndex < tabStateFiles.Count)
+                    RestoreTabState(tabStateFiles[selectedTabStateIndex]);
+            };
+
+            this.splitContainerTabState.Panel2.Controls.Add(this.textBoxTabStateContent);
+            this.splitContainerTabState.Panel2.Controls.Add(btnRestoreTab);
+
             // tabs - AntdUI card-style tabs
             this.tabs.Dock = DockStyle.Fill;
             this.tabs.Type = AntdUI.TabType.Card;
@@ -3359,11 +3572,26 @@ namespace ManageNotepadWindows
             tabHistory.IconSvg = SvgHistory;
             tabHistory.Controls.Add(this.splitContainerHistory);
 
+            var tabCache = new AntdUI.TabPage();
+            tabCache.Text = "Notepad Cache";
+            tabCache.IconSvg = SvgFile;
+            tabCache.Controls.Add(this.splitContainerTabState);
+
             this.tabs.Pages.Add(tabNotepads);
             this.tabs.Pages.Add(tabBrowser);
             this.tabs.Pages.Add(tabShells);
             this.tabs.Pages.Add(tabHistory);
-            this.tabs.SelectedIndexChanged += (s, e) => UpdateStatus();
+            this.tabs.Pages.Add(tabCache);
+            this.tabs.SelectedIndexChanged += (s, e) =>
+            {
+                UpdateStatus();
+                if (tabs.SelectedIndex == 4 && tabStateFiles.Count == 0)
+                {
+                    PopulateTabState();
+                    RefreshTabStateTable();
+                    UpdateStatus();
+                }
+            };
 
             // panelTop - styled toolbar with shadow
             this.panelTop.Dock = DockStyle.Top;
@@ -3422,6 +3650,9 @@ namespace ManageNotepadWindows
             this.splitContainerHistory.Panel2.ResumeLayout(false);
             ((System.ComponentModel.ISupportInitialize)(this.splitContainerHistory)).EndInit();
             this.splitContainerHistory.ResumeLayout(false);
+            this.splitContainerTabState.Panel2.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerTabState)).EndInit();
+            this.splitContainerTabState.ResumeLayout(false);
             this.panelTop.ResumeLayout(false);
         }
 
