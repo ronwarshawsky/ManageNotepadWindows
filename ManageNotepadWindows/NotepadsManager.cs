@@ -8,8 +8,12 @@ using System.Linq;
 using System.Drawing;
 using System.Windows.Forms;
 using System.Windows.Automation;
+using System.Net.Http;
+using System.Text.Json;
+using System.Management;
 using AntdUI;
 using Microsoft.Win32;
+using Microsoft.Data.Sqlite;
 
 namespace ManageNotepadWindows
 {
@@ -30,6 +34,10 @@ namespace ManageNotepadWindows
         // Sorting state for Browser Tabs grid
         private int browserSortColumnIndex = -1;
         private bool browserSortAscending = true;
+
+        // Sorting state for Shells grid
+        private int shellSortColumnIndex = -1;
+        private bool shellSortAscending = true;
 
         private readonly string backupDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "NotepadBackups");
         private readonly string settingsFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "NotepadBackups", "settings.json");
@@ -54,17 +62,41 @@ namespace ManageNotepadWindows
         // Tab control - using AntdUI.Tabs for modern card-style tabs
         private AntdUI.Tabs tabs;
 
-        // Browser tabs (for future implementation)
+        // Browser tabs
         private AntdUI.Table tableBrowserTabs;
         private List<BrowserTabInfo> browserTabs = new List<BrowserTabInfo>();
         private RichTextBox textBoxBrowserContent;
         private SplitContainer splitContainerBrowser;
+
+        // Shell windows (cmd, PowerShell, bash, etc.)
+        private AntdUI.Table tableShells;
+        private List<ShellWindowInfo> shellWindows = new List<ShellWindowInfo>();
+        private RichTextBox textBoxShellContent;
+        private SplitContainer splitContainerShells;
+        private AntdUI.Panel panelShellPreview;
+
+        // Browser History
+        private AntdUI.Table tableHistory;
+        private List<BrowserHistoryInfo> browserHistory = new List<BrowserHistoryInfo>();
+        private SplitContainer splitContainerHistory;
+        private RichTextBox textBoxHistoryDetails;
+        private int selectedHistoryIndex = -1;
+        private int historySortColumnIndex = -1;
+        private bool historySortAscending = true;
+        // private System.Windows.Forms.ToolTip historyToolTip; // Disabled for now
+        private System.Windows.Forms.ContextMenuStrip historyContextMenu;
+
+        // History table column widths (single source of truth)
+        private const int HistoryColBrowserWidth = 70;
+        private const int HistoryColLastVisitWidth = 130;
 
         // Status bar
         private AntdUI.Panel panelStatus;
         private AntdUI.Label labelStatus;
         private int totalNotepadCount = 0;
         private int totalBrowserCount = 0;
+        private int totalShellCount = 0;
+        private int totalHistoryCount = 0;
 
         // Native helpers (consolidated)
         [DllImport("user32.dll", SetLastError = true)]
@@ -101,6 +133,57 @@ namespace ManageNotepadWindows
         private delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
         [DllImport("user32.dll")]
         private static extern bool ReleaseCapture();
+        [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+
+        // Virtual key codes for keyboard simulation
+        private const byte VK_CONTROL = 0x11;
+        private const byte VK_SHIFT = 0x10;
+        private const byte VK_A = 0x41;
+        private const byte VK_C = 0x43;
+        private const byte VK_ESCAPE = 0x1B;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+
+        // Console API for reading shell buffer
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(uint dwProcessId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FreeConsole();
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetConsoleScreenBufferInfo(IntPtr hConsoleOutput, out CONSOLE_SCREEN_BUFFER_INFO lpConsoleScreenBufferInfo);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool ReadConsoleOutputCharacter(IntPtr hConsoleOutput, StringBuilder lpCharacter, uint nLength, COORD dwReadCoord, out uint lpNumberOfCharsRead);
+
+        private const int STD_OUTPUT_HANDLE = -11;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct COORD
+        {
+            public short X;
+            public short Y;
+            public COORD(short x, short y) { X = x; Y = y; }
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SMALL_RECT
+        {
+            public short Left;
+            public short Top;
+            public short Right;
+            public short Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CONSOLE_SCREEN_BUFFER_INFO
+        {
+            public COORD dwSize;
+            public COORD dwCursorPosition;
+            public short wAttributes;
+            public SMALL_RECT srWindow;
+            public COORD dwMaximumWindowSize;
+        }
 
         // Title dragging constants
         private const int WM_NCLBUTTONDOWN = 0x00A1;
@@ -113,6 +196,8 @@ namespace ManageNotepadWindows
         private const string SvgFile = "<svg viewBox=\"0 0 1024 1024\"><path d=\"M854.6 288.6L639.4 73.4c-6-6-14.1-9.4-22.6-9.4H192c-17.7 0-32 14.3-32 32v832c0 17.7 14.3 32 32 32h640c17.7 0 32-14.3 32-32V311.3c0-8.5-3.4-16.7-9.4-22.7zM790.2 326H602V137.8L790.2 326zm1.8 562H232V136h302v216a42 42 0 0 0 42 42h216v494z\"/></svg>";
         private const string SvgGlobal = "<svg viewBox=\"0 0 1024 1024\"><path d=\"M512 64C264.6 64 64 264.6 64 512s200.6 448 448 448 448-200.6 448-448S759.4 64 512 64zm0 820c-205.4 0-372-166.6-372-372s166.6-372 372-372 372 166.6 372 372-166.6 372-372 372zm5.6-532.7c53 0 89 33.8 93 83.4.3 4.2 3.8 7.4 8 7.4h56.7c2.6 0 4.7-2.1 4.7-4.7 0-86.7-68.4-147.4-162.7-147.4C407.4 290 344 364.2 344 486.8v52.3C344 660.8 407.4 734 517.3 734c94 0 162.7-58.8 162.7-141.4 0-2.6-2.1-4.7-4.7-4.7H618c-4.2 0-7.7 3.2-8 7.4-4.2 46.1-40.1 77.8-93 77.8-65.3 0-102.1-47.9-102.1-133.6v-52.6c.1-87 37-135.5 102.7-135.5z\"/></svg>";
         private const string SvgSearch = "<svg viewBox=\"0 0 1024 1024\"><path d=\"M909.6 854.5L649.9 594.8C690.2 542.7 714 479.9 714 412c0-158.2-128.8-287-287-287S140 253.8 140 412s128.8 287 287 287c67.9 0 130.7-23.8 182.8-63.5l259.7 259.6a8.2 8.2 0 0 0 11.6 0l28.5-28.5c3.2-3.2 3.2-8.4 0-11.6zM427 682c-150.2 0-272-121.8-272-272s121.8-272 272-272 272 121.8 272 272-121.8 272-272 272z\"/></svg>";
+        private const string SvgTerminal = "<svg viewBox=\"0 0 1024 1024\"><path d=\"M928 140H96c-17.7 0-32 14.3-32 32v680c0 17.7 14.3 32 32 32h832c17.7 0 32-14.3 32-32V172c0-17.7-14.3-32-32-32zm-40 632H136V212h752v560zM304 460l152 120-152 120v-92H200v-56h104v-92zm216 180h200v56H520v-56z\"/></svg>";
+        private const string SvgHistory = "<svg viewBox=\"0 0 1024 1024\"><path d=\"M536 128c-221 0-400 179-400 400s179 400 400 400 400-179 400-400-179-400-400-400zm0 720c-176.7 0-320-143.3-320-320s143.3-320 320-320 320 143.3 320 320-143.3 320-320 320zm62-320h158c4.4 0 8-3.6 8-8v-48c0-4.4-3.6-8-8-8H560V296c0-4.4-3.6-8-8-8h-48c-4.4 0-8 3.6-8 8v232c0 4.4 3.6 8 8 8h94z\"/></svg>";
 
         // Other constants
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
@@ -142,6 +227,37 @@ namespace ManageNotepadWindows
             public string Title { get; set; }
             public string Url { get; set; }
             public string Preview { get; set; }
+            public long MemoryBytes { get; set; }
+            public string MemoryFormatted
+            {
+                get
+                {
+                    if (MemoryBytes <= 0) return "";
+                    double mb = MemoryBytes / (1024.0 * 1024.0);
+                    if (mb >= 1024)
+                        return $"{mb / 1024:F1} GB";
+                    return $"{mb:F0} MB";
+                }
+            }
+        }
+
+        private class ShellWindowInfo : AntdUI.NotifyProperty
+        {
+            public IntPtr Hwnd { get; set; }
+            public int ProcessId { get; set; }
+            public string Title { get; set; }
+            public string ShellType { get; set; }  // cmd, PowerShell, Bash, etc.
+            public string ProcessName { get; set; }
+        }
+
+        private class BrowserHistoryInfo : AntdUI.NotifyProperty
+        {
+            public string Title { get; set; }
+            public string Url { get; set; }
+            public DateTime LastVisit { get; set; }
+            public int VisitCount { get; set; }
+            public string Browser { get; set; }  // Chrome, Edge, Firefox
+            public string LastVisitFormatted => LastVisit.ToString("yyyy-MM-dd HH:mm");
         }
 
         // Settings for persistence
@@ -151,6 +267,10 @@ namespace ManageNotepadWindows
             public bool NotepadSortAscending { get; set; } = true;
             public int BrowserSortColumn { get; set; } = -1;
             public bool BrowserSortAscending { get; set; } = true;
+            public int ShellSortColumn { get; set; } = -1;
+            public bool ShellSortAscending { get; set; } = true;
+            public int HistorySortColumn { get; set; } = -1;
+            public bool HistorySortAscending { get; set; } = true;
         }
 
         public NotepadsManager()
@@ -179,8 +299,10 @@ namespace ManageNotepadWindows
             // Behavior
             SetupGrid();
             SetupBrowserGrid();
+            SetupShellsGrid();
+            SetupHistoryGrid();
             MakeWindowTopMost();
-            this.Load += NotepadsManager_Load;
+            // Load event is registered in InitializeComponent
             this.FormClosing += NotepadsManager_FormClosing;
 
             // keyboard shortcuts
@@ -251,7 +373,8 @@ namespace ManageNotepadWindows
                 };
 
                 // Define columns with sorting enabled - Title and URL share remaining width equally via "fill"
-                tableBrowserTabs.Columns.Add(new AntdUI.Column("ProcessId", "PID") { Width = "80", SortOrder = true });
+                tableBrowserTabs.Columns.Add(new AntdUI.Column("ProcessId", "PID") { Width = "70", SortOrder = true });
+                tableBrowserTabs.Columns.Add(new AntdUI.Column("MemoryFormatted", "Memory") { Width = "80", SortOrder = true });
                 tableBrowserTabs.Columns.Add(new AntdUI.Column("Title", "Title") { Width = "fill", SortOrder = true });
                 tableBrowserTabs.Columns.Add(new AntdUI.Column("Url", "URL") { Width = "fill", SortOrder = true });
 
@@ -269,9 +392,97 @@ namespace ManageNotepadWindows
             }
         }
 
+        private void SetupShellsGrid()
+        {
+            if (tableShells == null)
+            {
+                tableShells = new AntdUI.Table
+                {
+                    Dock = DockStyle.Fill,
+                    Radius = 6,
+                    FixedHeader = true,
+                    EnableHeaderResizing = true,
+                    RowSelectedBg = Color.FromArgb(230, 247, 255),
+                    RowSelectedFore = Color.Black,
+                    BorderColor = Color.FromArgb(217, 217, 217),
+                    EmptyText = "No shell windows found"
+                };
+
+                // Define columns with sorting enabled
+                tableShells.Columns.Add(new AntdUI.Column("ProcessId", "PID") { Width = "80", SortOrder = true });
+                tableShells.Columns.Add(new AntdUI.Column("ShellType", "Type") { Width = "120", SortOrder = true });
+                tableShells.Columns.Add(new AntdUI.Column("Title", "Title") { SortOrder = true });
+
+                // Event handlers
+                tableShells.CellClick += TableShells_CellClick;
+                tableShells.CellDoubleClick += TableShells_CellDoubleClick;
+                tableShells.SelectIndexChanged += TableShells_SelectIndexChanged;
+                tableShells.SortRows += TableShells_SortRows;
+            }
+
+            if (splitContainerShells != null)
+            {
+                splitContainerShells.Panel1.Controls.Clear();
+                splitContainerShells.Panel1.Controls.Add(tableShells);
+            }
+        }
+
+        private void SetupHistoryGrid()
+        {
+            if (tableHistory == null)
+            {
+                tableHistory = new AntdUI.Table
+                {
+                    Dock = DockStyle.Fill,
+                    Radius = 6,
+                    FixedHeader = true,
+                    EnableHeaderResizing = true,
+                    RowSelectedBg = Color.FromArgb(230, 247, 255),
+                    RowSelectedFore = Color.Black,
+                    BorderColor = Color.FromArgb(217, 217, 217),
+                    EmptyText = "No browser history found"
+                };
+
+                // Define columns with sorting enabled
+                tableHistory.Columns.Add(new AntdUI.Column("Browser", "Browser") { Width = HistoryColBrowserWidth.ToString(), SortOrder = true });
+                tableHistory.Columns.Add(new AntdUI.Column("LastVisitFormatted", "Last Visit") { Width = HistoryColLastVisitWidth.ToString(), SortOrder = true });
+                tableHistory.Columns.Add(new AntdUI.Column("Title", "Title") { Width = "fill", SortOrder = true, Ellipsis = true });
+                tableHistory.Columns.Add(new AntdUI.Column("Url", "URL") { Width = "fill", SortOrder = true, Ellipsis = true });
+
+                // Event handlers
+                tableHistory.CellClick += TableHistory_CellClick;
+                tableHistory.CellDoubleClick += TableHistory_CellDoubleClick;
+                tableHistory.SelectIndexChanged += TableHistory_SelectIndexChanged;
+                tableHistory.SortRows += TableHistory_SortRows;
+
+                // Tooltip for Title and URL columns - disabled for now
+                // historyToolTip = new System.Windows.Forms.ToolTip();
+                // historyToolTip.AutoPopDelay = 10000;
+                // historyToolTip.InitialDelay = 500;
+                // historyToolTip.ReshowDelay = 200;
+                // historyToolTip.ShowAlways = true;
+                // tableHistory.MouseMove += TableHistory_MouseMove;
+                // tableHistory.MouseLeave += (s, e) => HideHistoryTooltip();
+
+                // Context menu for right-click
+                historyContextMenu = new System.Windows.Forms.ContextMenuStrip();
+                var deleteMenuItem = new System.Windows.Forms.ToolStripMenuItem("Delete from history...");
+                deleteMenuItem.Click += HistoryDeleteMenuItem_Click;
+                historyContextMenu.Items.Add(deleteMenuItem);
+                tableHistory.MouseUp += TableHistory_MouseUp;
+            }
+
+            if (splitContainerHistory != null)
+            {
+                splitContainerHistory.Panel1.Controls.Clear();
+                splitContainerHistory.Panel1.Controls.Add(tableHistory);
+            }
+        }
+
         // Track selected row indices for AntdUI.Table
         private int selectedNotepadIndex = -1;
         private int selectedBrowserIndex = -1;
+        private int selectedShellIndex = -1;
 
         private void TableNotepadWindows_CellClick(object sender, AntdUI.TableClickEventArgs e)
         {
@@ -334,26 +545,672 @@ namespace ManageNotepadWindows
             if (hwnd != IntPtr.Zero) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
         }
 
-        private void LoadBrowserPreview(int rowIndex)
+        private async void LoadBrowserPreview(int rowIndex)
         {
             if (rowIndex < 0 || rowIndex >= browserTabs.Count) { textBoxBrowserContent.Text = string.Empty; return; }
             var info = browserTabs[rowIndex];
 
-            // Display tab info
+            // Display tab info header
             var sb = new StringBuilder();
             sb.AppendLine($"Title: {info.Title}");
             sb.AppendLine($"URL: {info.Url ?? "Unknown"}");
             sb.AppendLine($"PID: {info.ProcessId}");
             sb.AppendLine($"Window Handle: 0x{info.Hwnd.ToString("X")}");
-
-            if (!string.IsNullOrWhiteSpace(info.Preview))
-            {
-                sb.AppendLine();
-                sb.AppendLine("Preview:");
-                sb.AppendLine(info.Preview);
-            }
+            sb.AppendLine();
+            sb.AppendLine("--- Page Content (loading...) ---");
 
             textBoxBrowserContent.Text = sb.ToString();
+
+            // Try to read browser content via clipboard
+            string pageContent = await System.Threading.Tasks.Task.Run(() => TryReadBrowserViaClipboard(info.Hwnd));
+
+            // Verify selection hasn't changed while loading
+            if (selectedBrowserIndex == rowIndex)
+            {
+                sb.Clear();
+                sb.AppendLine($"Title: {info.Title}");
+                sb.AppendLine($"URL: {info.Url ?? "Unknown"}");
+                sb.AppendLine($"PID: {info.ProcessId}");
+                sb.AppendLine($"Window Handle: 0x{info.Hwnd.ToString("X")}");
+                sb.AppendLine();
+                sb.AppendLine("--- Page Content ---");
+                sb.AppendLine(pageContent);
+                textBoxBrowserContent.Text = sb.ToString();
+            }
+        }
+
+        private string TryReadBrowserViaClipboard(IntPtr hwnd)
+        {
+            try
+            {
+                string originalClipboard = null;
+                string browserContent = null;
+
+                // Capture our window handle on the UI thread
+                IntPtr ourWindow = IntPtr.Zero;
+                if (this.InvokeRequired)
+                {
+                    this.Invoke(new Action(() => ourWindow = this.Handle));
+                }
+                else
+                {
+                    ourWindow = this.Handle;
+                }
+
+                // Must run on STA thread for clipboard operations
+                var thread = new System.Threading.Thread(() =>
+                {
+                    try
+                    {
+                        // Save original clipboard content
+                        if (System.Windows.Forms.Clipboard.ContainsText())
+                        {
+                            originalClipboard = System.Windows.Forms.Clipboard.GetText();
+                        }
+
+                        // Clear clipboard to detect if copy worked
+                        System.Windows.Forms.Clipboard.Clear();
+
+                        // Activate browser window - needs real focus for Ctrl+A/C to work
+                        ShowWindow(hwnd, SW_RESTORE);
+                        SetForegroundWindow(hwnd);
+                        System.Threading.Thread.Sleep(150); // Give browser time to activate
+
+                        // Send Ctrl+A using keybd_event (more reliable than SendKeys)
+                        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+                        keybd_event(VK_A, 0, 0, UIntPtr.Zero);
+                        keybd_event(VK_A, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                        System.Threading.Thread.Sleep(150);
+
+                        // Send Ctrl+C using keybd_event
+                        keybd_event(VK_CONTROL, 0, 0, UIntPtr.Zero);
+                        keybd_event(VK_C, 0, 0, UIntPtr.Zero);
+                        keybd_event(VK_C, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                        keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                        System.Threading.Thread.Sleep(150);
+
+                        // Press Escape to deselect
+                        keybd_event(VK_ESCAPE, 0, 0, UIntPtr.Zero);
+                        keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+
+                        // Restore focus to our window
+                        System.Threading.Thread.Sleep(50);
+                        SetForegroundWindow(ourWindow);
+
+                        // Read clipboard content
+                        System.Threading.Thread.Sleep(50);
+                        if (System.Windows.Forms.Clipboard.ContainsText())
+                        {
+                            browserContent = System.Windows.Forms.Clipboard.GetText();
+                        }
+
+                        // Restore original clipboard
+                        if (originalClipboard != null)
+                        {
+                            System.Windows.Forms.Clipboard.SetText(originalClipboard);
+                        }
+                        else
+                        {
+                            System.Windows.Forms.Clipboard.Clear();
+                        }
+                    }
+                    catch { }
+                });
+
+                thread.SetApartmentState(System.Threading.ApartmentState.STA);
+                thread.Start();
+                thread.Join(3000); // Max 3 second timeout for browsers
+
+                if (!string.IsNullOrWhiteSpace(browserContent))
+                {
+                    // Limit to last 50 lines to avoid huge content
+                    var lines = browserContent.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    int startIdx = Math.Max(0, lines.Length - 50);
+                    var lastLines = new StringBuilder();
+                    for (int i = startIdx; i < lines.Length; i++)
+                    {
+                        lastLines.AppendLine(lines[i]);
+                    }
+                    return lastLines.ToString().TrimEnd();
+                }
+
+                return "[Unable to read browser content]";
+            }
+            catch (Exception ex)
+            {
+                return $"[Error: {ex.Message}]";
+            }
+        }
+
+        private void TableShells_CellClick(object sender, AntdUI.TableClickEventArgs e)
+        {
+            // Selection change is handled by SelectIndexChanged
+        }
+
+        private void TableShells_SelectIndexChanged(object sender, EventArgs e)
+        {
+            // Single source of truth for selection changes (both click and keyboard)
+            int selectedIdx = tableShells?.SelectedIndex ?? -1;
+            if (selectedIdx > 0)
+            {
+                int rowIndex = selectedIdx - 1; // Convert to 0-based
+                if (rowIndex >= 0 && rowIndex < shellWindows.Count)
+                {
+                    selectedShellIndex = rowIndex;
+                    LoadShellPreview(rowIndex);
+                }
+            }
+        }
+
+        private void TableShells_CellDoubleClick(object sender, AntdUI.TableClickEventArgs e)
+        {
+            // Use Record directly - no index conversion needed
+            if (e.Record is not ShellWindowInfo item) return;
+            IntPtr hwnd = item.Hwnd;
+            if (hwnd != IntPtr.Zero) { ShowWindow(hwnd, SW_RESTORE); SetForegroundWindow(hwnd); }
+        }
+
+        private void TableHistory_CellClick(object sender, AntdUI.TableClickEventArgs e)
+        {
+            // Selection change is handled by SelectIndexChanged
+        }
+
+        private void TableHistory_SelectIndexChanged(object sender, EventArgs e)
+        {
+            // Single source of truth for selection changes (both click and keyboard)
+            int selectedIdx = tableHistory?.SelectedIndex ?? -1;
+            if (selectedIdx > 0)
+            {
+                int rowIndex = selectedIdx - 1; // Convert to 0-based
+                if (rowIndex >= 0 && rowIndex < browserHistory.Count)
+                {
+                    selectedHistoryIndex = rowIndex;
+                    LoadHistoryPreview(rowIndex);
+                }
+            }
+        }
+
+        private void TableHistory_CellDoubleClick(object sender, AntdUI.TableClickEventArgs e)
+        {
+            // Open URL in default browser
+            if (e.Record is not BrowserHistoryInfo item) return;
+            if (!string.IsNullOrWhiteSpace(item.Url))
+            {
+                try
+                {
+                    Process.Start(new ProcessStartInfo(item.Url) { UseShellExecute = true });
+                }
+                catch { }
+            }
+        }
+
+        private void LoadHistoryPreview(int rowIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= browserHistory.Count) { textBoxHistoryDetails.Text = string.Empty; return; }
+            var info = browserHistory[rowIndex];
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"Title: {info.Title}");
+            sb.AppendLine($"URL: {info.Url}");
+            sb.AppendLine($"Browser: {info.Browser}");
+            sb.AppendLine($"Last Visit: {info.LastVisit:yyyy-MM-dd HH:mm:ss}");
+            sb.AppendLine($"Visit Count: {info.VisitCount}");
+            sb.AppendLine();
+            sb.AppendLine("Double-click to open in browser");
+
+            textBoxHistoryDetails.Text = sb.ToString();
+        }
+
+        // Tooltip tracking - disabled for now
+        // private int lastHistoryTooltipRow = -1;
+        // private int lastHistoryTooltipCol = -1;
+        // private void TableHistory_MouseMove(object sender, MouseEventArgs e) { ... }
+        // private void HideHistoryTooltip() { ... }
+
+        private void TableHistory_MouseUp(object sender, MouseEventArgs e)
+        {
+            if (e.Button == MouseButtons.Right)
+            {
+                // Calculate row from Y position
+                int headerHeight = 42;
+                int rowHeight = 42;
+                int rowIndex = (e.Y - headerHeight) / rowHeight;
+
+                if (rowIndex >= 0 && rowIndex < browserHistory.Count)
+                {
+                    // Select the row under cursor
+                    tableHistory.SelectedIndex = rowIndex + 1; // 1-based
+                    selectedHistoryIndex = rowIndex;
+                    LoadHistoryPreview(rowIndex);
+
+                    // Show context menu
+                    historyContextMenu.Show(tableHistory, e.Location);
+                }
+            }
+        }
+
+        private void HistoryDeleteMenuItem_Click(object sender, EventArgs e)
+        {
+            if (selectedHistoryIndex < 0 || selectedHistoryIndex >= browserHistory.Count)
+                return;
+
+            var item = browserHistory[selectedHistoryIndex];
+
+            var result = MessageBox.Show(
+                $"Delete this entry from browser history?\n\nTitle: {item.Title}\nURL: {item.Url}",
+                "Delete History Entry",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (result == DialogResult.Yes)
+            {
+                // Delete from database
+                bool deleted = DeleteHistoryEntry(item);
+
+                if (deleted)
+                {
+                    // Remove from list and refresh
+                    browserHistory.RemoveAt(selectedHistoryIndex);
+                    totalHistoryCount = browserHistory.Count;
+                    RefreshHistoryTable();
+                    UpdateStatus();
+
+                    // Clear preview
+                    textBoxHistoryDetails.Text = "Entry deleted.";
+                    selectedHistoryIndex = -1;
+                }
+                else
+                {
+                    MessageBox.Show("Failed to delete entry from browser history.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+        }
+
+        private bool DeleteHistoryEntry(BrowserHistoryInfo item)
+        {
+            try
+            {
+                string historyPath = item.Browser == "Chrome"
+                    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Google\Chrome\User Data\Default\History")
+                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Microsoft\Edge\User Data\Default\History");
+
+                if (!File.Exists(historyPath)) return false;
+
+                // Copy to temp file (database is locked while browser is running)
+                string tempPath = Path.Combine(Path.GetTempPath(), $"history_delete_{Guid.NewGuid()}.db");
+                File.Copy(historyPath, tempPath, true);
+
+                try
+                {
+                    using (var connection = new SqliteConnection($"Data Source={tempPath}"))
+                    {
+                        connection.Open();
+                        using (var command = connection.CreateCommand())
+                        {
+                            command.CommandText = "DELETE FROM urls WHERE url = @url";
+                            command.Parameters.AddWithValue("@url", item.Url);
+                            int rowsAffected = command.ExecuteNonQuery();
+
+                            if (rowsAffected > 0)
+                            {
+                                // Copy back to original (browser must be closed for this to work)
+                                try
+                                {
+                                    File.Copy(tempPath, historyPath, true);
+                                    return true;
+                                }
+                                catch
+                                {
+                                    // Browser is probably running - can't update the file
+                                    MessageBox.Show(
+                                        $"Please close {item.Browser} and try again.\nThe browser's history file is locked.",
+                                        "Browser Running",
+                                        MessageBoxButtons.OK,
+                                        MessageBoxIcon.Warning);
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    try { File.Delete(tempPath); } catch { }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error deleting history entry: {ex.Message}");
+                return false;
+            }
+        }
+
+        private string WrapTooltipText(string text, int maxLineLength)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length <= maxLineLength)
+                return text;
+
+            var sb = new StringBuilder();
+            int pos = 0;
+            while (pos < text.Length)
+            {
+                int len = Math.Min(maxLineLength, text.Length - pos);
+                if (sb.Length > 0) sb.AppendLine();
+                sb.Append(text.Substring(pos, len));
+                pos += len;
+            }
+            return sb.ToString();
+        }
+
+        private async void LoadShellPreview(int rowIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= shellWindows.Count) { textBoxShellContent.Text = string.Empty; return; }
+            var info = shellWindows[rowIndex];
+
+            // Display shell info header
+            var sb = new StringBuilder();
+            sb.AppendLine($"Title: {info.Title}");
+            sb.AppendLine($"Type: {info.ShellType}");
+            sb.AppendLine($"Process: {info.ProcessName}");
+            sb.AppendLine($"PID: {info.ProcessId}");
+            sb.AppendLine($"Window Handle: 0x{info.Hwnd.ToString("X")}");
+            sb.AppendLine();
+            sb.AppendLine("--- Console Buffer (last 20 lines) ---");
+            sb.AppendLine("Loading...");
+
+            textBoxShellContent.Text = sb.ToString();
+
+            // Try to read console buffer asynchronously
+            string bufferContent = await System.Threading.Tasks.Task.Run(() => ReadConsoleBuffer(info.ProcessId, info.Hwnd, info.ProcessName));
+
+            // Verify selection hasn't changed while loading
+            if (selectedShellIndex == rowIndex)
+            {
+                sb.Clear();
+                sb.AppendLine($"Title: {info.Title}");
+                sb.AppendLine($"Type: {info.ShellType}");
+                sb.AppendLine($"Process: {info.ProcessName}");
+                sb.AppendLine($"PID: {info.ProcessId}");
+                sb.AppendLine($"Window Handle: 0x{info.Hwnd.ToString("X")}");
+                sb.AppendLine();
+                sb.AppendLine("--- Console Buffer (last 20 lines) ---");
+                sb.AppendLine(bufferContent);
+                textBoxShellContent.Text = sb.ToString();
+            }
+        }
+
+        private string ReadConsoleBuffer(int processId, IntPtr hwnd, string processName)
+        {
+            // For Windows Terminal, skip directly to clipboard approach (Console API and UIA don't work)
+            if (processName.Equals("WindowsTerminal", StringComparison.OrdinalIgnoreCase))
+            {
+                return TryReadTerminalViaClipboard(hwnd);
+            }
+
+            // First try classic Console API (works for cmd.exe, powershell.exe with conhost)
+            string classicResult = TryReadClassicConsole(processId);
+            if (!classicResult.StartsWith("["))
+                return classicResult;
+
+            // Fallback to UI Automation (works for some terminals)
+            string uiaResult = TryReadTerminalViaUIA(hwnd);
+            if (!uiaResult.StartsWith("["))
+                return uiaResult;
+
+            // Last resort: clipboard approach
+            string clipboardResult = TryReadTerminalViaClipboard(hwnd);
+            if (!clipboardResult.StartsWith("["))
+                return clipboardResult;
+
+            return "[Unable to read terminal content]";
+        }
+
+        private string TryReadClassicConsole(int processId)
+        {
+            try
+            {
+                // First, detach from any existing console
+                FreeConsole();
+
+                // Try to attach to the target process's console
+                if (!AttachConsole((uint)processId))
+                {
+                    int error = System.Runtime.InteropServices.Marshal.GetLastWin32Error();
+                    if (error == 5) // Access denied
+                        return "[Access denied - process may be elevated]";
+                    if (error == 6) // Invalid handle
+                        return "[No console attached to this process]";
+                    if (error == 31) // Device not functioning
+                        return "[Console not available - may be Windows Terminal]";
+                    return $"[Unable to attach to console: error {error}]";
+                }
+
+                try
+                {
+                    IntPtr hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+                    if (hConsole == IntPtr.Zero || hConsole == new IntPtr(-1))
+                    {
+                        return "[Unable to get console handle]";
+                    }
+
+                    if (!GetConsoleScreenBufferInfo(hConsole, out CONSOLE_SCREEN_BUFFER_INFO csbi))
+                    {
+                        return "[Unable to get console buffer info]";
+                    }
+
+                    int bufferWidth = csbi.dwSize.X;
+                    int cursorY = csbi.dwCursorPosition.Y;
+
+                    // Read last 20 lines (or fewer if buffer is smaller)
+                    int linesToRead = Math.Min(20, cursorY + 1);
+                    int startLine = Math.Max(0, cursorY - linesToRead + 1);
+
+                    var result = new StringBuilder();
+                    for (int y = startLine; y <= cursorY; y++)
+                    {
+                        var lineBuffer = new StringBuilder(bufferWidth);
+                        COORD coord = new COORD(0, (short)y);
+                        if (ReadConsoleOutputCharacter(hConsole, lineBuffer, (uint)bufferWidth, coord, out uint charsRead))
+                        {
+                            string line = lineBuffer.ToString(0, (int)Math.Min(charsRead, bufferWidth)).TrimEnd();
+                            result.AppendLine(line);
+                        }
+                    }
+
+                    string content = result.ToString().TrimEnd();
+                    return string.IsNullOrWhiteSpace(content) ? "[Console buffer is empty]" : content;
+                }
+                finally
+                {
+                    FreeConsole();
+                }
+            }
+            catch (Exception ex)
+            {
+                return $"[Error reading console: {ex.Message}]";
+            }
+        }
+
+        private string TryReadTerminalViaUIA(IntPtr hwnd)
+        {
+            try
+            {
+                var windowElement = AutomationElement.FromHandle(hwnd);
+                if (windowElement == null) return "[UIA: window element null]";
+
+                // Try to find terminal/text control - Windows Terminal uses custom control
+                // Look for elements with TextPattern support
+                var walker = TreeWalker.ContentViewWalker;
+                var textContent = FindTerminalTextRecursive(windowElement, 0);
+
+                if (!string.IsNullOrWhiteSpace(textContent))
+                {
+                    // Get last 20 lines
+                    var lines = textContent.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    int startIdx = Math.Max(0, lines.Length - 20);
+                    var lastLines = new StringBuilder();
+                    for (int i = startIdx; i < lines.Length; i++)
+                    {
+                        lastLines.AppendLine(lines[i]);
+                    }
+                    return lastLines.ToString().TrimEnd();
+                }
+
+                // UIA failed, try clipboard approach for Windows Terminal
+                return TryReadTerminalViaClipboard(hwnd);
+            }
+            catch (Exception ex)
+            {
+                return $"[UIA error: {ex.Message}]";
+            }
+        }
+
+        private string TryReadTerminalViaClipboard(IntPtr hwnd)
+        {
+            try
+            {
+                string originalClipboard = null;
+                string terminalContent = null;
+
+                // Capture our window handle on the calling thread (which may be a background thread)
+                // We need to get it from the UI thread
+                IntPtr ourWindow = IntPtr.Zero;
+                if (this.InvokeRequired)
+                {
+                    this.Invoke(new Action(() => ourWindow = this.Handle));
+                }
+                else
+                {
+                    ourWindow = this.Handle;
+                }
+
+                // Must run on STA thread for clipboard operations
+                var thread = new System.Threading.Thread(() =>
+                {
+                    try
+                    {
+                        // Save original clipboard content
+                        if (System.Windows.Forms.Clipboard.ContainsText())
+                        {
+                            originalClipboard = System.Windows.Forms.Clipboard.GetText();
+                        }
+
+                        // Clear clipboard to detect if copy worked
+                        System.Windows.Forms.Clipboard.Clear();
+
+                        // Make our window topmost temporarily so terminal doesn't visually come to front
+                        SetWindowPos(ourWindow, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+                        // Activate terminal window (it gets focus but stays behind our window visually)
+                        IntPtr currentForeground = GetForegroundWindow();
+                        SetForegroundWindow(hwnd);
+                        System.Threading.Thread.Sleep(30);
+
+                        // Send Ctrl+Shift+A (select all in Windows Terminal) then Ctrl+Shift+C (copy)
+                        System.Windows.Forms.SendKeys.SendWait("^+a"); // Ctrl+Shift+A
+                        System.Threading.Thread.Sleep(30);
+                        System.Windows.Forms.SendKeys.SendWait("^+c"); // Ctrl+Shift+C
+                        System.Threading.Thread.Sleep(30);
+
+                        // Send Escape to deselect
+                        System.Windows.Forms.SendKeys.SendWait("{ESC}");
+
+                        // Remove topmost flag and restore focus
+                        SetWindowPos(ourWindow, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                        SetForegroundWindow(ourWindow);
+
+                        // Read clipboard content
+                        System.Threading.Thread.Sleep(20);
+                        if (System.Windows.Forms.Clipboard.ContainsText())
+                        {
+                            terminalContent = System.Windows.Forms.Clipboard.GetText();
+                        }
+
+                        // Restore original clipboard
+                        if (originalClipboard != null)
+                        {
+                            System.Windows.Forms.Clipboard.SetText(originalClipboard);
+                        }
+                        else
+                        {
+                            System.Windows.Forms.Clipboard.Clear();
+                        }
+                    }
+                    catch { }
+                });
+
+                thread.SetApartmentState(System.Threading.ApartmentState.STA);
+                thread.Start();
+                thread.Join(2000); // Max 2 second timeout
+
+                if (!string.IsNullOrWhiteSpace(terminalContent))
+                {
+                    // Get last 30 lines
+                    var lines = terminalContent.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    int startIdx = Math.Max(0, lines.Length - 30);
+                    var lastLines = new StringBuilder();
+                    for (int i = startIdx; i < lines.Length; i++)
+                    {
+                        lastLines.AppendLine(lines[i]);
+                    }
+                    return lastLines.ToString().TrimEnd();
+                }
+
+                return "[Unable to read terminal content]";
+            }
+            catch (Exception ex)
+            {
+                return $"[Clipboard error: {ex.Message}]";
+            }
+        }
+
+        private static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        private string FindTerminalTextRecursive(AutomationElement element, int depth)
+        {
+            if (depth > 10) return null; // Prevent infinite recursion
+
+            try
+            {
+                // Try TextPattern first (best for terminals)
+                object patternObj;
+                if (element.TryGetCurrentPattern(TextPattern.Pattern, out patternObj))
+                {
+                    var textPattern = (TextPattern)patternObj;
+                    string text = textPattern.DocumentRange.GetText(-1);
+                    if (!string.IsNullOrWhiteSpace(text)) return text;
+                }
+
+                // Try ValuePattern
+                if (element.TryGetCurrentPattern(ValuePattern.Pattern, out patternObj))
+                {
+                    var valuePattern = (ValuePattern)patternObj;
+                    string val = valuePattern.Current.Value;
+                    if (!string.IsNullOrWhiteSpace(val)) return val;
+                }
+
+                // Check element name (sometimes contains text)
+                var name = element.Current.Name;
+                if (!string.IsNullOrWhiteSpace(name) && name.Length > 50) // Likely terminal content
+                    return name;
+
+                // Search children
+                var children = element.FindAll(TreeScope.Children, System.Windows.Automation.Condition.TrueCondition);
+                foreach (AutomationElement child in children)
+                {
+                    var result = FindTerminalTextRecursive(child, depth + 1);
+                    if (!string.IsNullOrWhiteSpace(result)) return result;
+                }
+            }
+            catch { }
+
+            return null;
         }
 
         private async void LoadNotepadPreviewAsync(int rowIndex)
@@ -451,6 +1308,250 @@ namespace ManageNotepadWindows
             }
         }
 
+        // Browser process info including command line
+        private class BrowserProcessInfo
+        {
+            public int ProcessId { get; set; }
+            public string ProcessName { get; set; }
+            public string CommandLine { get; set; }
+            public long MemoryBytes { get; set; }
+            public string ProcessType { get; set; } // browser, renderer, gpu, utility, etc.
+            public string SiteOrigin { get; set; } // extracted from command line for renderers
+        }
+
+        // Cache of browser process info
+        private List<BrowserProcessInfo> _browserProcessCache = new List<BrowserProcessInfo>();
+
+        // Get all browser processes with their command lines using WMI
+        private void RefreshBrowserProcessInfo()
+        {
+            _browserProcessCache.Clear();
+
+            try
+            {
+                // Query WMI for processes with command lines
+                string query = "SELECT ProcessId, Name, CommandLine FROM Win32_Process WHERE Name LIKE 'chrome%' OR Name LIKE 'msedge%' OR Name LIKE 'brave%' OR Name LIKE 'firefox%'";
+
+                using (var searcher = new ManagementObjectSearcher(query))
+                using (var results = searcher.Get())
+                {
+                    foreach (ManagementObject obj in results)
+                    {
+                        try
+                        {
+                            int pid = Convert.ToInt32(obj["ProcessId"]);
+                            string name = obj["Name"]?.ToString() ?? "";
+                            string cmdLine = obj["CommandLine"]?.ToString() ?? "";
+
+                            // Get memory for this process
+                            long memory = 0;
+                            try
+                            {
+                                var proc = Process.GetProcessById(pid);
+                                memory = proc.WorkingSet64;
+                            }
+                            catch { }
+
+                            // Determine process type from command line
+                            string processType = "browser";
+                            string siteOrigin = "";
+
+                            if (cmdLine.Contains("--type=renderer"))
+                            {
+                                processType = "renderer";
+                                // Try to extract site origin from command line
+                                siteOrigin = ExtractSiteOrigin(cmdLine);
+                            }
+                            else if (cmdLine.Contains("--type=gpu"))
+                                processType = "gpu";
+                            else if (cmdLine.Contains("--type=utility"))
+                                processType = "utility";
+                            else if (cmdLine.Contains("--type=crashpad"))
+                                processType = "crashpad";
+                            else if (cmdLine.Contains("--extension-process"))
+                                processType = "extension";
+
+                            _browserProcessCache.Add(new BrowserProcessInfo
+                            {
+                                ProcessId = pid,
+                                ProcessName = name.Replace(".exe", ""),
+                                CommandLine = cmdLine,
+                                MemoryBytes = memory,
+                                ProcessType = processType,
+                                SiteOrigin = siteOrigin
+                            });
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        // Extract site origin from renderer command line (e.g., --site-per-process-site=https://example.com)
+        private string ExtractSiteOrigin(string cmdLine)
+        {
+            // Look for site isolation flags
+            var patterns = new[]
+            {
+                "--site-per-process-site=",
+                "--isolation-by-site-origin=",
+                "--renderer-client-id="
+            };
+
+            foreach (var pattern in patterns)
+            {
+                int idx = cmdLine.IndexOf(pattern, StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0)
+                {
+                    int start = idx + pattern.Length;
+                    int end = cmdLine.IndexOf(' ', start);
+                    if (end < 0) end = cmdLine.Length;
+                    string value = cmdLine.Substring(start, end - start).Trim('"');
+
+                    // Try to extract domain from URL
+                    if (Uri.TryCreate(value, UriKind.Absolute, out Uri uri))
+                    {
+                        return uri.Host.ToLowerInvariant();
+                    }
+                    return value.ToLowerInvariant();
+                }
+            }
+
+            return "";
+        }
+
+        // Get per-tab memory by matching tabs to renderer processes
+        private void CalculatePerTabMemory()
+        {
+            // Refresh browser process info
+            RefreshBrowserProcessInfo();
+
+            // Get only renderer processes
+            var renderers = _browserProcessCache
+                .Where(p => p.ProcessType == "renderer")
+                .ToList();
+
+            // Group tabs by browser type
+            var tabsByBrowser = browserTabs
+                .GroupBy(t =>
+                {
+                    try
+                    {
+                        var proc = Process.GetProcessById(t.ProcessId);
+                        return proc.ProcessName.ToLowerInvariant();
+                    }
+                    catch { return "unknown"; }
+                })
+                .ToDictionary(g => g.Key, g => g.ToList());
+
+            foreach (var kvp in tabsByBrowser)
+            {
+                string browserName = kvp.Key;
+                var tabs = kvp.Value;
+
+                // Get renderers for this browser
+                var browserRenderers = renderers
+                    .Where(r => r.ProcessName.ToLowerInvariant().Contains(browserName) ||
+                                browserName.Contains(r.ProcessName.ToLowerInvariant()))
+                    .ToList();
+
+                if (browserRenderers.Count == 0)
+                {
+                    // No renderer info, use main process memory
+                    foreach (var tab in tabs)
+                    {
+                        try
+                        {
+                            var proc = Process.GetProcessById(tab.ProcessId);
+                            tab.MemoryBytes = proc.WorkingSet64;
+                        }
+                        catch { }
+                    }
+                    continue;
+                }
+
+                // Try to match tabs to renderers by site origin
+                var unmatchedTabs = new List<BrowserTabInfo>();
+                var usedRenderers = new HashSet<int>();
+
+                foreach (var tab in tabs)
+                {
+                    bool matched = false;
+
+                    if (!string.IsNullOrEmpty(tab.Url))
+                    {
+                        // Extract domain from tab URL
+                        string tabDomain = "";
+                        if (Uri.TryCreate(tab.Url, UriKind.Absolute, out Uri uri))
+                        {
+                            tabDomain = uri.Host.ToLowerInvariant();
+                        }
+
+                        if (!string.IsNullOrEmpty(tabDomain))
+                        {
+                            // Find a renderer with matching site origin
+                            var matchingRenderer = browserRenderers
+                                .Where(r => !usedRenderers.Contains(r.ProcessId) &&
+                                           !string.IsNullOrEmpty(r.SiteOrigin) &&
+                                           (r.SiteOrigin.Contains(tabDomain) || tabDomain.Contains(r.SiteOrigin)))
+                                .OrderByDescending(r => r.MemoryBytes)
+                                .FirstOrDefault();
+
+                            if (matchingRenderer != null)
+                            {
+                                tab.MemoryBytes = matchingRenderer.MemoryBytes;
+                                usedRenderers.Add(matchingRenderer.ProcessId);
+                                matched = true;
+                            }
+                        }
+                    }
+
+                    if (!matched)
+                    {
+                        unmatchedTabs.Add(tab);
+                    }
+                }
+
+                // For unmatched tabs, distribute remaining renderer memory
+                var unusedRenderers = browserRenderers
+                    .Where(r => !usedRenderers.Contains(r.ProcessId))
+                    .ToList();
+
+                if (unmatchedTabs.Count > 0 && unusedRenderers.Count > 0)
+                {
+                    // Sort both by some criteria and assign
+                    long avgMemory = unusedRenderers.Sum(r => r.MemoryBytes) / Math.Max(unmatchedTabs.Count, 1);
+
+                    foreach (var tab in unmatchedTabs)
+                    {
+                        if (unusedRenderers.Count > 0)
+                        {
+                            var renderer = unusedRenderers[0];
+                            tab.MemoryBytes = renderer.MemoryBytes;
+                            unusedRenderers.RemoveAt(0);
+                        }
+                        else
+                        {
+                            tab.MemoryBytes = avgMemory;
+                        }
+                    }
+                }
+                else if (unmatchedTabs.Count > 0)
+                {
+                    // No unused renderers, calculate average from all renderers
+                    long avgMemory = browserRenderers.Count > 0
+                        ? browserRenderers.Sum(r => r.MemoryBytes) / browserRenderers.Count
+                        : 0;
+
+                    foreach (var tab in unmatchedTabs)
+                    {
+                        tab.MemoryBytes = avgMemory;
+                    }
+                }
+            }
+        }
+
         private void PopulateBrowserTabs()
         {
             browserTabs.Clear();
@@ -497,13 +1598,17 @@ namespace ManageNotepadWindows
                             ProcessId = (int)pid,
                             Title = titleStr,
                             Url = url,
-                            Preview = preview
+                            Preview = preview,
+                            MemoryBytes = 0 // Will be calculated after enumeration
                         });
                     }
                 }
                 catch { }
                 return true;
             }, IntPtr.Zero);
+
+            // Calculate per-tab average memory
+            CalculatePerTabMemory();
 
             // preserve sorting if active
             if (browserSortColumnIndex != -1) SortBrowserTabsByColumn(browserSortColumnIndex);
@@ -519,6 +1624,280 @@ namespace ManageNotepadWindows
             {
                 tableBrowserTabs.DataSource = null;
                 tableBrowserTabs.DataSource = new List<BrowserTabInfo>(browserTabs);
+            }
+        }
+
+        private void PopulateShells()
+        {
+            shellWindows.Clear();
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                try
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+
+                    StringBuilder className = new StringBuilder(256);
+                    GetClassName(hWnd, className, className.Capacity);
+                    var cls = className.ToString();
+
+                    // Check for shell window classes
+                    // ConsoleWindowClass: cmd.exe, PowerShell (legacy)
+                    // CASCADIA_HOSTING_WINDOW_CLASS: Windows Terminal
+                    // mintty: Git Bash, MSYS2
+                    // VirtualConsoleClass: ConEmu
+                    if (cls == "ConsoleWindowClass" || cls == "CASCADIA_HOSTING_WINDOW_CLASS" ||
+                        cls == "mintty" || cls == "VirtualConsoleClass")
+                    {
+                        GetWindowThreadProcessId(hWnd, out uint pid);
+
+                        StringBuilder title = new StringBuilder(256);
+                        GetWindowText(hWnd, title, title.Capacity);
+                        string titleStr = title.ToString();
+                        if (string.IsNullOrWhiteSpace(titleStr)) return true;
+
+                        // Determine shell type from title or process name
+                        string shellType = "Unknown";
+                        string processName = "";
+                        try
+                        {
+                            var proc = Process.GetProcessById((int)pid);
+                            processName = proc.ProcessName;
+                            shellType = DetermineShellType(titleStr, processName, cls);
+                        }
+                        catch { }
+
+                        shellWindows.Add(new ShellWindowInfo
+                        {
+                            Hwnd = hWnd,
+                            ProcessId = (int)pid,
+                            Title = titleStr,
+                            ShellType = shellType,
+                            ProcessName = processName
+                        });
+                    }
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+
+            // preserve sorting if active
+            if (shellSortColumnIndex != -1) SortShellsByColumn(shellSortColumnIndex);
+            else
+            {
+                RefreshShellsTable();
+            }
+        }
+
+        private string DetermineShellType(string title, string processName, string className)
+        {
+            string lowerTitle = title.ToLower();
+            string lowerProc = processName.ToLower();
+
+            // Windows Terminal
+            if (className == "CASCADIA_HOSTING_WINDOW_CLASS" || lowerProc == "windowsterminal")
+            {
+                // Try to determine what's inside Windows Terminal from title
+                if (lowerTitle.Contains("powershell") || lowerTitle.Contains("pwsh")) return "PowerShell";
+                if (lowerTitle.Contains("cmd")) return "CMD";
+                if (lowerTitle.Contains("bash") || lowerTitle.Contains("ubuntu") || lowerTitle.Contains("wsl")) return "Bash/WSL";
+                return "Terminal";
+            }
+
+            // Git Bash / MSYS
+            if (className == "mintty" || lowerProc == "mintty")
+            {
+                if (lowerTitle.Contains("mingw") || lowerTitle.Contains("msys")) return "MSYS2";
+                return "Git Bash";
+            }
+
+            // ConEmu
+            if (className == "VirtualConsoleClass") return "ConEmu";
+
+            // Legacy console
+            if (lowerProc == "powershell" || lowerProc == "pwsh") return "PowerShell";
+            if (lowerProc == "cmd") return "CMD";
+            if (lowerProc == "bash" || lowerProc == "sh") return "Bash";
+            if (lowerProc == "wsl") return "WSL";
+
+            // Fallback - check title
+            if (lowerTitle.Contains("powershell")) return "PowerShell";
+            if (lowerTitle.Contains("command prompt") || lowerTitle.StartsWith("c:\\")) return "CMD";
+            if (lowerTitle.Contains("bash")) return "Bash";
+
+            return "Console";
+        }
+
+        private void RefreshShellsTable()
+        {
+            if (tableShells != null)
+            {
+                tableShells.DataSource = null;
+                tableShells.DataSource = new List<ShellWindowInfo>(shellWindows);
+            }
+        }
+
+        private void PopulateHistory()
+        {
+            browserHistory.Clear();
+
+            // Read Chrome history
+            ReadChromeHistory();
+
+            // Read Edge history
+            ReadEdgeHistory();
+
+            // Sort by last visit (most recent first) by default
+            browserHistory = browserHistory.OrderByDescending(h => h.LastVisit).ToList();
+
+            // Limit to last 500 entries for performance
+            if (browserHistory.Count > 2000)
+            {
+                browserHistory = browserHistory.Take(2000).ToList();
+            }
+
+            totalHistoryCount = browserHistory.Count;
+
+            // preserve sorting if active
+            if (historySortColumnIndex != -1) SortHistoryByColumn(historySortColumnIndex);
+            else
+            {
+                RefreshHistoryTable();
+            }
+        }
+
+        private void ReadChromeHistory()
+        {
+            try
+            {
+                string historyPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    @"Google\Chrome\User Data\Default\History");
+
+                if (!File.Exists(historyPath)) return;
+
+                // Copy to temp file (database is locked while Chrome is running)
+                string tempPath = Path.Combine(Path.GetTempPath(), $"chrome_history_{Guid.NewGuid()}.db");
+                File.Copy(historyPath, tempPath, true);
+
+                try
+                {
+                    using (var connection = new SqliteConnection($"Data Source={tempPath};Mode=ReadOnly"))
+                    {
+                        connection.Open();
+                        using (var command = connection.CreateCommand())
+                        {
+                            command.CommandText = @"
+                                SELECT url, title, visit_count, last_visit_time
+                                FROM urls
+                                ORDER BY last_visit_time DESC
+                                LIMIT 1000";
+
+                            using (var reader = command.ExecuteReader())
+                            {
+                                while (reader.Read())
+                                {
+                                    string url = reader.GetString(0);
+                                    string title = reader.IsDBNull(1) ? url : reader.GetString(1);
+                                    int visitCount = reader.GetInt32(2);
+                                    long lastVisitTime = reader.GetInt64(3);
+
+                                    // Chrome stores time as microseconds since 1601-01-01
+                                    DateTime lastVisit = DateTime.FromFileTimeUtc(lastVisitTime * 10).ToLocalTime();
+
+                                    browserHistory.Add(new BrowserHistoryInfo
+                                    {
+                                        Title = string.IsNullOrWhiteSpace(title) ? url : title,
+                                        Url = url,
+                                        VisitCount = visitCount,
+                                        LastVisit = lastVisit,
+                                        Browser = "Chrome"
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    try { File.Delete(tempPath); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error reading Chrome history: {ex.Message}");
+            }
+        }
+
+        private void ReadEdgeHistory()
+        {
+            try
+            {
+                string historyPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    @"Microsoft\Edge\User Data\Default\History");
+
+                if (!File.Exists(historyPath)) return;
+
+                // Copy to temp file (database is locked while Edge is running)
+                string tempPath = Path.Combine(Path.GetTempPath(), $"edge_history_{Guid.NewGuid()}.db");
+                File.Copy(historyPath, tempPath, true);
+
+                try
+                {
+                    using (var connection = new SqliteConnection($"Data Source={tempPath};Mode=ReadOnly"))
+                    {
+                        connection.Open();
+                        using (var command = connection.CreateCommand())
+                        {
+                            command.CommandText = @"
+                                SELECT url, title, visit_count, last_visit_time
+                                FROM urls
+                                ORDER BY last_visit_time DESC
+                                LIMIT 1000";
+
+                            using (var reader = command.ExecuteReader())
+                            {
+                                while (reader.Read())
+                                {
+                                    string url = reader.GetString(0);
+                                    string title = reader.IsDBNull(1) ? url : reader.GetString(1);
+                                    int visitCount = reader.GetInt32(2);
+                                    long lastVisitTime = reader.GetInt64(3);
+
+                                    // Edge stores time as microseconds since 1601-01-01 (same as Chrome)
+                                    DateTime lastVisit = DateTime.FromFileTimeUtc(lastVisitTime * 10).ToLocalTime();
+
+                                    browserHistory.Add(new BrowserHistoryInfo
+                                    {
+                                        Title = string.IsNullOrWhiteSpace(title) ? url : title,
+                                        Url = url,
+                                        VisitCount = visitCount,
+                                        LastVisit = lastVisit,
+                                        Browser = "Edge"
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    try { File.Delete(tempPath); } catch { }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error reading Edge history: {ex.Message}");
+            }
+        }
+
+        private void RefreshHistoryTable()
+        {
+            if (tableHistory != null)
+            {
+                tableHistory.DataSource = null;
+                tableHistory.DataSource = new List<BrowserHistoryInfo>(browserHistory);
             }
         }
 
@@ -632,47 +2011,56 @@ namespace ManageNotepadWindows
 
         private void BackupUnsavedNotepadContent()
         {
-            var processes = Process.GetProcessesByName("notepad");
-            foreach (var process in processes)
+            EnumWindows((hWnd, lParam) =>
             {
                 try
                 {
-                    IntPtr hWnd = process.MainWindowHandle;
-                    if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd)) continue;
-                    var title = new StringBuilder(256);
-                    GetWindowText(hWnd, title, title.Capacity);
-                    if (title.ToString().Contains("Untitled - Notepad"))
-                    {
-                        string content = GetNotepadText(hWnd, -1);
-                        string backupFilePath = Path.Combine(backupDir, $"NotepadBackup_{process.Id}.txt");
-                        File.WriteAllText(backupFilePath, content);
-                    }
-                    else
-                    {
-                        string backupFilePath = Path.Combine(backupDir, $"NotepadBackup_{process.Id}.txt");
-                        if (File.Exists(backupFilePath)) File.Delete(backupFilePath);
-                    }
+                    if (!IsWindowVisible(hWnd)) return true;
+
+                    var cls = new StringBuilder(256);
+                    GetClassName(hWnd, cls, cls.Capacity);
+                    var clsStr = cls.ToString();
+                    if (clsStr != "Notepad" && clsStr != "CascadiaWindow") return true;
+
+                    string content = ExtractNotepadContentForBackup(hWnd, clsStr);
+                    if (IsNotepadTextError(content)) return true;
+
+                    string backupPath = Path.Combine(backupDir, $"NotepadBackup_{hWnd.ToInt64()}.txt");
+                    File.WriteAllText(backupPath, content);
                 }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine($"Error backing up notepad process {process.Id}: {ex.Message}");
-                }
-            }
+                catch (Exception ex) { Debug.WriteLine($"Backup error for hWnd {hWnd}: {ex.Message}"); }
+                return true;
+            }, IntPtr.Zero);
+
             CleanupObsoleteBackups();
         }
 
         private void CleanupObsoleteBackups()
         {
-            string[] backupFiles = Directory.GetFiles(backupDir, "NotepadBackup_*.txt");
-            var running = new HashSet<int>(Process.GetProcessesByName("notepad").Select(p => p.Id));
-            foreach (var f in backupFiles)
+            var openHwnds = new HashSet<long>();
+            EnumWindows((hWnd, lParam) =>
+            {
+                try
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+                    var cls = new StringBuilder(256);
+                    GetClassName(hWnd, cls, cls.Capacity);
+                    var clsStr = cls.ToString();
+                    if (clsStr == "Notepad" || clsStr == "CascadiaWindow")
+                        openHwnds.Add(hWnd.ToInt64());
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+
+            foreach (var f in Directory.GetFiles(backupDir, "NotepadBackup_*.txt"))
             {
                 try
                 {
                     var name = Path.GetFileNameWithoutExtension(f);
                     var parts = name.Split('_');
-                    if (parts.Length < 2 || !int.TryParse(parts[1], out int pid)) continue;
-                    if (!running.Contains(pid)) File.Delete(f);
+                    if (parts.Length < 2 || !long.TryParse(parts[1], out long hwndVal)) continue;
+                    if (!openHwnds.Contains(hwndVal)) File.Delete(f);
                 }
                 catch (Exception ex) { Debug.WriteLine($"Error deleting backup {f}: {ex.Message}"); }
             }
@@ -680,31 +2068,132 @@ namespace ManageNotepadWindows
 
         private void RestoreBackupNotepadContent()
         {
-            string[] backupFiles = Directory.GetFiles(backupDir, "NotepadBackup_*.txt");
-            foreach (var backupFile in backupFiles)
+            var openHwnds = new HashSet<long>();
+            EnumWindows((hWnd, lParam) =>
+            {
+                try
+                {
+                    if (!IsWindowVisible(hWnd)) return true;
+                    var cls = new StringBuilder(256);
+                    GetClassName(hWnd, cls, cls.Capacity);
+                    var clsStr = cls.ToString();
+                    if (clsStr == "Notepad" || clsStr == "CascadiaWindow")
+                        openHwnds.Add(hWnd.ToInt64());
+                }
+                catch { }
+                return true;
+            }, IntPtr.Zero);
+
+            foreach (var backupFile in Directory.GetFiles(backupDir, "NotepadBackup_*.txt"))
             {
                 try
                 {
                     var name = Path.GetFileNameWithoutExtension(backupFile);
                     var parts = name.Split('_');
-                    if (parts.Length < 2 || !int.TryParse(parts[1], out int pid)) continue;
-                    bool running = Process.GetProcessesByName("notepad").Any(p => p.Id == pid);
-                    if (running) continue;
+                    if (parts.Length < 2 || !long.TryParse(parts[1], out long hwndVal)) continue;
+                    if (openHwnds.Contains(hwndVal)) continue;
 
                     string content = File.ReadAllText(backupFile);
+                    if (string.IsNullOrWhiteSpace(content)) { File.Delete(backupFile); continue; }
+
                     var notepad = Process.Start("notepad.exe");
-                    if (!notepad.WaitForInputIdle(5000)) continue; // 5 second timeout
-                    IntPtr hwnd = notepad.MainWindowHandle;
-                    IntPtr edit = FindWindowEx(hwnd, IntPtr.Zero, "Edit", null);
-                    if (edit != IntPtr.Zero)
+                    if (notepad == null || !notepad.WaitForInputIdle(5000)) continue;
+
+                    IntPtr hwnd = IntPtr.Zero;
+                    for (int i = 0; i < 10 && hwnd == IntPtr.Zero; i++)
                     {
-                        IntPtr result;
-                        SendMessageTimeout(edit, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content), SMTO_ABORTIFHUNG, 2000, out result);
-                        SendMessageTimeout(edit, WM_CHAR, new IntPtr(' '), IntPtr.Zero, SMTO_ABORTIFHUNG, 1000, out result);
+                        System.Threading.Thread.Sleep(200);
+                        notepad.Refresh();
+                        hwnd = notepad.MainWindowHandle;
                     }
+                    if (hwnd == IntPtr.Zero) continue;
+
+                    if (TrySetNotepadText(hwnd, content))
+                        File.Delete(backupFile);
                 }
                 catch (Exception ex) { Debug.WriteLine($"Error restoring backup {backupFile}: {ex.Message}"); }
             }
+        }
+
+        private string ExtractNotepadContentForBackup(IntPtr hWnd, string windowClass)
+        {
+            if (windowClass == "CascadiaWindow")
+                return GetNotepadTextModern(hWnd);
+
+            string text = GetNotepadText(hWnd, -1);
+            if (!IsNotepadTextError(text)) return text;
+
+            return GetNotepadTextModern(hWnd);
+        }
+
+        private static bool IsNotepadTextError(string text) =>
+            string.IsNullOrWhiteSpace(text) ||
+            text.StartsWith("[") ||
+            text == "Unable to find text content." ||
+            text == "Window not responding." ||
+            text == "No content available." ||
+            text == "Content too large.";
+
+        private bool TrySetNotepadText(IntPtr hwnd, string content)
+        {
+            // Classic Notepad: Edit child control
+            IntPtr edit = FindWindowEx(hwnd, IntPtr.Zero, "Edit", null);
+            if (edit != IntPtr.Zero)
+            {
+                IntPtr result;
+                SendMessageTimeout(edit, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content), SMTO_ABORTIFHUNG, 2000, out result);
+                return true;
+            }
+
+            // Win11 Notepad: search for RichEdit child classes
+            string[] richEditClasses = { "RichEdit20W", "RichEdit20A", "RICHEDIT50W", "RichEditD2DPT", "RichEdit50W" };
+            bool setViaChild = false;
+            EnumChildWindows(hwnd, (child, lparam) =>
+            {
+                var cls = new StringBuilder(256);
+                GetClassName(child, cls, cls.Capacity);
+                if (richEditClasses.Contains(cls.ToString()))
+                {
+                    IntPtr result;
+                    SendMessageTimeout(child, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content), SMTO_ABORTIFHUNG, 2000, out result);
+                    setViaChild = true;
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            if (setViaChild) return true;
+
+            // UIA ValuePattern fallback
+            try
+            {
+                var task = System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        var windowElement = AutomationElement.FromHandle(hwnd);
+                        if (windowElement == null) return false;
+                        System.Windows.Automation.ControlType[] tryTypes = {
+                            System.Windows.Automation.ControlType.Edit,
+                            System.Windows.Automation.ControlType.Document
+                        };
+                        foreach (var ct in tryTypes)
+                        {
+                            var element = windowElement.FindFirst(TreeScope.Descendants,
+                                new PropertyCondition(AutomationElement.ControlTypeProperty, ct));
+                            if (element == null) continue;
+                            if (element.TryGetCurrentPattern(ValuePattern.Pattern, out object patternObj))
+                            {
+                                ((ValuePattern)patternObj).SetValue(content);
+                                return true;
+                            }
+                        }
+                        return false;
+                    }
+                    catch { return false; }
+                });
+                return task.Wait(3000) && task.Result;
+            }
+            catch { return false; }
         }
 
         private string TryGetTextFromChildClasses(IntPtr parentHandle)
@@ -859,6 +2348,14 @@ namespace ManageNotepadWindows
             {
                 await PerformBrowserSearchAsync();
             }
+            else if (tabs != null && tabs.SelectedIndex == 2)
+            {
+                await PerformShellsSearchAsync();
+            }
+            else if (tabs != null && tabs.SelectedIndex == 3)
+            {
+                await PerformHistorySearchAsync();
+            }
             else
             {
                 await PerformNotepadSearchAsync();
@@ -914,7 +2411,8 @@ namespace ManageNotepadWindows
                                     ProcessId = (int)pid,
                                     Title = titleStr,
                                     Url = url,
-                                    Preview = ""
+                                    Preview = "",
+                                    MemoryBytes = 0 // Will be calculated after enumeration
                                 });
                             }
                         }
@@ -929,8 +2427,119 @@ namespace ManageNotepadWindows
             browserTabs.Clear();
             browserTabs.AddRange(browserResults);
 
+            // Calculate per-tab memory using WMI process info
+            CalculatePerTabMemory();
+
             if (browserSortColumnIndex != -1) SortBrowserTabsByColumn(browserSortColumnIndex);
             else RefreshBrowserTable();
+
+            UpdateStatus();
+        }
+
+        private async System.Threading.Tasks.Task PerformShellsSearchAsync()
+        {
+            string searchText = textBoxSearch.Text.ToLower();
+
+            // If search is empty, just populate all shells
+            if (string.IsNullOrWhiteSpace(searchText))
+            {
+                PopulateShells();
+                RefreshShellsTable();
+                return;
+            }
+
+            var shellResults = await System.Threading.Tasks.Task.Run(() =>
+            {
+                var tempResults = new List<ShellWindowInfo>();
+
+                EnumWindows((hWnd, lParam) =>
+                {
+                    try
+                    {
+                        if (!IsWindowVisible(hWnd)) return true;
+
+                        var cls = new StringBuilder(256);
+                        GetClassName(hWnd, cls, cls.Capacity);
+                        var clsStr = cls.ToString();
+
+                        if (clsStr == "ConsoleWindowClass" || clsStr == "CASCADIA_HOSTING_WINDOW_CLASS" ||
+                            clsStr == "mintty" || clsStr == "VirtualConsoleClass")
+                        {
+                            GetWindowThreadProcessId(hWnd, out uint pid);
+
+                            var titleSb = new StringBuilder(256);
+                            GetWindowText(hWnd, titleSb, titleSb.Capacity);
+                            string titleStr = titleSb.ToString();
+                            if (string.IsNullOrWhiteSpace(titleStr)) return true;
+
+                            string shellType = "Unknown";
+                            string processName = "";
+                            try
+                            {
+                                var proc = Process.GetProcessById((int)pid);
+                                processName = proc.ProcessName;
+                                shellType = DetermineShellType(titleStr, processName, clsStr);
+                            }
+                            catch { }
+
+                            // Match against title, shell type, or process name
+                            if (titleStr.ToLower().Contains(searchText) ||
+                                shellType.ToLower().Contains(searchText) ||
+                                processName.ToLower().Contains(searchText))
+                            {
+                                tempResults.Add(new ShellWindowInfo
+                                {
+                                    Hwnd = hWnd,
+                                    ProcessId = (int)pid,
+                                    Title = titleStr,
+                                    ShellType = shellType,
+                                    ProcessName = processName
+                                });
+                            }
+                        }
+                    }
+                    catch { }
+                    return true;
+                }, IntPtr.Zero);
+
+                return tempResults;
+            });
+
+            shellWindows.Clear();
+            shellWindows.AddRange(shellResults);
+
+            if (shellSortColumnIndex != -1) SortShellsByColumn(shellSortColumnIndex);
+            else RefreshShellsTable();
+
+            UpdateStatus();
+        }
+
+        private async System.Threading.Tasks.Task PerformHistorySearchAsync()
+        {
+            string searchText = textBoxSearch.Text.ToLower();
+
+            // If search is empty, reload all history
+            if (string.IsNullOrWhiteSpace(searchText))
+            {
+                PopulateHistory();
+                RefreshHistoryTable();
+                return;
+            }
+
+            var historyResults = await System.Threading.Tasks.Task.Run(() =>
+            {
+                // Filter the existing history list (don't reload from database)
+                return browserHistory.Where(h =>
+                    (h.Title?.ToLower().Contains(searchText) ?? false) ||
+                    (h.Url?.ToLower().Contains(searchText) ?? false) ||
+                    (h.Browser?.ToLower().Contains(searchText) ?? false)
+                ).ToList();
+            });
+
+            browserHistory = historyResults;
+
+            if (historySortColumnIndex != -1) SortHistoryByColumn(historySortColumnIndex);
+            else RefreshHistoryTable();
 
             UpdateStatus();
         }
@@ -1042,6 +2651,21 @@ namespace ManageNotepadWindows
                 if (string.IsNullOrWhiteSpace(textBoxSearch.Text))
                     totalBrowserCount = browserTabs.Count;
             }
+            else if (tabs != null && tabs.SelectedIndex == 2)
+            {
+                // Shells tab - use search if filter is active
+                await PerformShellsSearchAsync();
+                if (string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                    totalShellCount = shellWindows.Count;
+            }
+            else if (tabs != null && tabs.SelectedIndex == 3)
+            {
+                // History tab - reload from database
+                await System.Threading.Tasks.Task.Run(() => PopulateHistory());
+                if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                    await PerformHistorySearchAsync();
+                RefreshHistoryTable();
+            }
 
             refresh.Enabled = true;
             refresh.Text = "Refresh";
@@ -1081,6 +2705,7 @@ namespace ManageNotepadWindows
             this.StartPosition = FormStartPosition.CenterScreen;
             if (splitContainer1 != null) splitContainer1.SplitterDistance = (int)(splitContainer1.Width * 0.60);
             if (splitContainerBrowser != null) splitContainerBrowser.SplitterDistance = (int)(splitContainerBrowser.Width * 0.60);
+            if (splitContainerShells != null) splitContainerShells.SplitterDistance = (int)(splitContainerShells.Width * 0.60);
 
             // Load saved settings (including sort order)
             LoadSettings();
@@ -1105,6 +2730,19 @@ namespace ManageNotepadWindows
             totalBrowserCount = browserTabs.Count;
             RefreshBrowserTable();
 
+            UpdateStatus("Loading shell windows...");
+
+            // Load shell windows (fast)
+            await System.Threading.Tasks.Task.Run(() => PopulateShells());
+            totalShellCount = shellWindows.Count;
+            RefreshShellsTable();
+
+            UpdateStatus("Loading browser history...");
+
+            // Load browser history (reads SQLite database)
+            await System.Threading.Tasks.Task.Run(() => PopulateHistory());
+            RefreshHistoryTable();
+
             // Apply saved sort order after data is loaded
             ApplySavedSortOrder();
             UpdateStatus();
@@ -1128,6 +2766,22 @@ namespace ManageNotepadWindows
                     labelStatus.Text = $"{browserTabs.Count} browser tab{(browserTabs.Count != 1 ? "s" : "")}";
                 else
                     labelStatus.Text = $"{browserTabs.Count} of {totalBrowserCount} browser tabs";
+            }
+            else if (tabs != null && tabs.SelectedIndex == 2)
+            {
+                // Shells tab
+                if (shellWindows.Count == totalShellCount || totalShellCount == 0)
+                    labelStatus.Text = $"{shellWindows.Count} shell window{(shellWindows.Count != 1 ? "s" : "")}";
+                else
+                    labelStatus.Text = $"{shellWindows.Count} of {totalShellCount} shell windows";
+            }
+            else if (tabs != null && tabs.SelectedIndex == 3)
+            {
+                // History tab
+                if (browserHistory.Count == totalHistoryCount || totalHistoryCount == 0)
+                    labelStatus.Text = $"{browserHistory.Count} history entr{(browserHistory.Count != 1 ? "ies" : "y")}";
+                else
+                    labelStatus.Text = $"{browserHistory.Count} of {totalHistoryCount} history entries";
             }
             else
             {
@@ -1169,6 +2823,7 @@ namespace ManageNotepadWindows
             // Scale splitter width
             this.splitContainer1.SplitterWidth = (int)(16 * dpiScaleFactor);
             this.splitContainerBrowser.SplitterWidth = (int)(16 * dpiScaleFactor);
+            this.splitContainerShells.SplitterWidth = (int)(16 * dpiScaleFactor);
         }
 
         private void TableNotepadWindows_SortRows(object sender, AntdUI.IntEventArgs e)
@@ -1220,6 +2875,9 @@ namespace ManageNotepadWindows
                 case "ProcessId":
                     sorted = ascending ? browserTabs.OrderBy(b => b.ProcessId) : browserTabs.OrderByDescending(b => b.ProcessId);
                     break;
+                case "MemoryFormatted":
+                    sorted = ascending ? browserTabs.OrderBy(b => b.MemoryBytes) : browserTabs.OrderByDescending(b => b.MemoryBytes);
+                    break;
                 case "Title":
                     sorted = ascending ? browserTabs.OrderBy(b => b.Title ?? "", StringComparer.CurrentCultureIgnoreCase) : browserTabs.OrderByDescending(b => b.Title ?? "", StringComparer.CurrentCultureIgnoreCase);
                     break;
@@ -1261,7 +2919,7 @@ namespace ManageNotepadWindows
         // Sorts the browser tabs in-memory list and refreshes the table
         private void SortBrowserTabsByColumn(int columnIndex)
         {
-            string[] columnNames = { "ProcessId", "Title", "Url" };
+            string[] columnNames = { "ProcessId", "MemoryFormatted", "Title", "Url" };
             if (columnIndex < 0 || columnIndex >= columnNames.Length) return;
             var name = columnNames[columnIndex];
             IEnumerable<BrowserTabInfo> sorted;
@@ -1270,6 +2928,9 @@ namespace ManageNotepadWindows
             {
                 case "ProcessId":
                     sorted = browserSortAscending ? browserTabs.OrderBy(b => b.ProcessId) : browserTabs.OrderByDescending(b => b.ProcessId);
+                    break;
+                case "MemoryFormatted":
+                    sorted = browserSortAscending ? browserTabs.OrderBy(b => b.MemoryBytes) : browserTabs.OrderByDescending(b => b.MemoryBytes);
                     break;
                 case "Title":
                     sorted = browserSortAscending ? browserTabs.OrderBy(b => b.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : browserTabs.OrderByDescending(b => b.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
@@ -1285,6 +2946,131 @@ namespace ManageNotepadWindows
             RefreshBrowserTable();
         }
 
+        private void TableShells_SortRows(object sender, AntdUI.IntEventArgs e)
+        {
+            int columnIndex = e.Value;
+            if (columnIndex < 0 || tableShells.Columns.Count <= columnIndex) return;
+
+            var column = tableShells.Columns[columnIndex];
+            bool ascending = column.SortMode == AntdUI.SortMode.ASC;
+
+            // Track sort state for persistence
+            shellSortColumnIndex = columnIndex;
+            shellSortAscending = ascending;
+
+            // Sort based on column key
+            IEnumerable<ShellWindowInfo> sorted;
+            switch (column.Key)
+            {
+                case "ProcessId":
+                    sorted = ascending ? shellWindows.OrderBy(s => s.ProcessId) : shellWindows.OrderByDescending(s => s.ProcessId);
+                    break;
+                case "ShellType":
+                    sorted = ascending ? shellWindows.OrderBy(s => s.ShellType ?? "", StringComparer.CurrentCultureIgnoreCase) : shellWindows.OrderByDescending(s => s.ShellType ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "Title":
+                    sorted = ascending ? shellWindows.OrderBy(s => s.Title ?? "", StringComparer.CurrentCultureIgnoreCase) : shellWindows.OrderByDescending(s => s.Title ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                default:
+                    return;
+            }
+
+            shellWindows = sorted.ToList();
+            RefreshShellsTable();
+        }
+
+        // Sorts the shell windows in-memory list and refreshes the table
+        private void SortShellsByColumn(int columnIndex)
+        {
+            string[] columnNames = { "ProcessId", "ShellType", "Title" };
+            if (columnIndex < 0 || columnIndex >= columnNames.Length) return;
+            var name = columnNames[columnIndex];
+            IEnumerable<ShellWindowInfo> sorted;
+
+            switch (name)
+            {
+                case "ProcessId":
+                    sorted = shellSortAscending ? shellWindows.OrderBy(s => s.ProcessId) : shellWindows.OrderByDescending(s => s.ProcessId);
+                    break;
+                case "ShellType":
+                    sorted = shellSortAscending ? shellWindows.OrderBy(s => s.ShellType ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : shellWindows.OrderByDescending(s => s.ShellType ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "Title":
+                    sorted = shellSortAscending ? shellWindows.OrderBy(s => s.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase) : shellWindows.OrderByDescending(s => s.Title ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                default:
+                    return;
+            }
+
+            shellWindows = sorted.ToList();
+            RefreshShellsTable();
+        }
+
+        private void TableHistory_SortRows(object sender, AntdUI.IntEventArgs e)
+        {
+            int columnIndex = e.Value;
+            if (columnIndex < 0 || tableHistory.Columns.Count <= columnIndex) return;
+
+            var column = tableHistory.Columns[columnIndex];
+            bool ascending = column.SortMode == AntdUI.SortMode.ASC;
+
+            // Track sort state for persistence
+            historySortColumnIndex = columnIndex;
+            historySortAscending = ascending;
+
+            // Sort based on column key
+            IEnumerable<BrowserHistoryInfo> sorted;
+            switch (column.Key)
+            {
+                case "Title":
+                    sorted = ascending ? browserHistory.OrderBy(h => h.Title ?? "", StringComparer.CurrentCultureIgnoreCase) : browserHistory.OrderByDescending(h => h.Title ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "Url":
+                    sorted = ascending ? browserHistory.OrderBy(h => h.Url ?? "", StringComparer.CurrentCultureIgnoreCase) : browserHistory.OrderByDescending(h => h.Url ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "LastVisitFormatted":
+                    sorted = ascending ? browserHistory.OrderBy(h => h.LastVisit) : browserHistory.OrderByDescending(h => h.LastVisit);
+                    break;
+                case "Browser":
+                    sorted = ascending ? browserHistory.OrderBy(h => h.Browser ?? "", StringComparer.CurrentCultureIgnoreCase) : browserHistory.OrderByDescending(h => h.Browser ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                default:
+                    return;
+            }
+
+            browserHistory = sorted.ToList();
+            RefreshHistoryTable();
+        }
+
+        private void SortHistoryByColumn(int columnIndex)
+        {
+            string[] columnNames = { "Browser", "LastVisitFormatted", "Title", "Url" };
+            if (columnIndex < 0 || columnIndex >= columnNames.Length) return;
+            var name = columnNames[columnIndex];
+            IEnumerable<BrowserHistoryInfo> sorted;
+
+            switch (name)
+            {
+                case "Browser":
+                    sorted = historySortAscending ? browserHistory.OrderBy(h => h.Browser ?? "", StringComparer.CurrentCultureIgnoreCase) : browserHistory.OrderByDescending(h => h.Browser ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "LastVisitFormatted":
+                    sorted = historySortAscending ? browserHistory.OrderBy(h => h.LastVisit) : browserHistory.OrderByDescending(h => h.LastVisit);
+                    break;
+                case "Title":
+                    sorted = historySortAscending ? browserHistory.OrderBy(h => h.Title ?? "", StringComparer.CurrentCultureIgnoreCase) : browserHistory.OrderByDescending(h => h.Title ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                case "Url":
+                    sorted = historySortAscending ? browserHistory.OrderBy(h => h.Url ?? "", StringComparer.CurrentCultureIgnoreCase) : browserHistory.OrderByDescending(h => h.Url ?? "", StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                default:
+                    return;
+            }
+
+            browserHistory = sorted.ToList();
+            RefreshHistoryTable();
+        }
+
         private void SaveSettings()
         {
             try
@@ -1294,7 +3080,11 @@ namespace ManageNotepadWindows
                     NotepadSortColumn = sortColumnIndex,
                     NotepadSortAscending = sortAscending,
                     BrowserSortColumn = browserSortColumnIndex,
-                    BrowserSortAscending = browserSortAscending
+                    BrowserSortAscending = browserSortAscending,
+                    ShellSortColumn = shellSortColumnIndex,
+                    ShellSortAscending = shellSortAscending,
+                    HistorySortColumn = historySortColumnIndex,
+                    HistorySortAscending = historySortAscending
                 };
 
                 string json = System.Text.Json.JsonSerializer.Serialize(settings);
@@ -1320,6 +3110,10 @@ namespace ManageNotepadWindows
                 sortAscending = settings.NotepadSortAscending;
                 browserSortColumnIndex = settings.BrowserSortColumn;
                 browserSortAscending = settings.BrowserSortAscending;
+                shellSortColumnIndex = settings.ShellSortColumn;
+                shellSortAscending = settings.ShellSortAscending;
+                historySortColumnIndex = settings.HistorySortColumn;
+                historySortAscending = settings.HistorySortAscending;
             }
             catch (Exception ex)
             {
@@ -1344,6 +3138,22 @@ namespace ManageNotepadWindows
                 col.SortMode = browserSortAscending ? AntdUI.SortMode.ASC : AntdUI.SortMode.DESC;
                 SortBrowserTabsByColumn(browserSortColumnIndex);
             }
+
+            // Apply shells table sort if saved
+            if (shellSortColumnIndex >= 0 && shellSortColumnIndex < tableShells?.Columns.Count)
+            {
+                var col = tableShells.Columns[shellSortColumnIndex];
+                col.SortMode = shellSortAscending ? AntdUI.SortMode.ASC : AntdUI.SortMode.DESC;
+                SortShellsByColumn(shellSortColumnIndex);
+            }
+
+            // Apply history table sort if saved
+            if (historySortColumnIndex >= 0 && historySortColumnIndex < tableHistory?.Columns.Count)
+            {
+                var col = tableHistory.Columns[historySortColumnIndex];
+                col.SortMode = historySortAscending ? AntdUI.SortMode.ASC : AntdUI.SortMode.DESC;
+                SortHistoryByColumn(historySortColumnIndex);
+            }
         }
 
         // Minimal InitializeComponent - creates controls used by the class.
@@ -1362,6 +3172,11 @@ namespace ManageNotepadWindows
             this.tabs = new AntdUI.Tabs();
             this.splitContainerBrowser = new SplitContainer();
             this.textBoxBrowserContent = new RichTextBox();
+            this.splitContainerShells = new SplitContainer();
+            this.textBoxShellContent = new RichTextBox();
+            this.panelShellPreview = new AntdUI.Panel();
+            this.splitContainerHistory = new SplitContainer();
+            this.textBoxHistoryDetails = new RichTextBox();
             this.panelStatus = new AntdUI.Panel();
             this.labelStatus = new AntdUI.Label();
 
@@ -1372,6 +3187,12 @@ namespace ManageNotepadWindows
             ((System.ComponentModel.ISupportInitialize)(this.splitContainerBrowser)).BeginInit();
             this.splitContainerBrowser.Panel2.SuspendLayout();
             this.splitContainerBrowser.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerShells)).BeginInit();
+            this.splitContainerShells.Panel2.SuspendLayout();
+            this.splitContainerShells.SuspendLayout();
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerHistory)).BeginInit();
+            this.splitContainerHistory.Panel2.SuspendLayout();
+            this.splitContainerHistory.SuspendLayout();
             this.panelTop.SuspendLayout();
 
             // refresh - styled AntdUI button with icon
@@ -1466,6 +3287,53 @@ namespace ManageNotepadWindows
             this.textBoxBrowserContent.BorderStyle = BorderStyle.None;
             this.textBoxBrowserContent.Text = "Browser tab preview will appear here...";
 
+            // panelShellPreview - wraps the shell preview textbox with shadow and rounded corners
+            this.panelShellPreview.Dock = DockStyle.Fill;
+            this.panelShellPreview.Shadow = 4;
+            this.panelShellPreview.Radius = 6;
+            this.panelShellPreview.Padding = new Padding(8);
+            this.panelShellPreview.Back = Color.White;
+            this.panelShellPreview.Controls.Add(this.textBoxShellContent);
+
+            // splitContainerShells (Shells tab)
+            this.splitContainerShells.Dock = DockStyle.Fill;
+            this.splitContainerShells.Size = new Size(850, 437);
+            this.splitContainerShells.SplitterDistance = 350;
+            this.splitContainerShells.SplitterWidth = 16;
+            this.splitContainerShells.BorderStyle = BorderStyle.None;
+            this.splitContainerShells.Panel2.Controls.Add(this.panelShellPreview);
+
+            // textBoxShellContent
+            this.textBoxShellContent.Dock = DockStyle.Fill;
+            this.textBoxShellContent.ReadOnly = true;
+            this.textBoxShellContent.ScrollBars = RichTextBoxScrollBars.Vertical;
+            this.textBoxShellContent.BorderStyle = BorderStyle.None;
+            this.textBoxShellContent.Text = "Shell window info will appear here...";
+
+            // panelHistoryPreview - wraps the history details textbox
+            var panelHistoryPreview = new AntdUI.Panel();
+            panelHistoryPreview.Dock = DockStyle.Fill;
+            panelHistoryPreview.Shadow = 4;
+            panelHistoryPreview.Radius = 6;
+            panelHistoryPreview.Padding = new Padding(8);
+            panelHistoryPreview.Back = Color.White;
+            panelHistoryPreview.Controls.Add(this.textBoxHistoryDetails);
+
+            // splitContainerHistory (Browser History tab)
+            this.splitContainerHistory.Dock = DockStyle.Fill;
+            this.splitContainerHistory.Size = new Size(850, 437);
+            this.splitContainerHistory.SplitterDistance = 350;
+            this.splitContainerHistory.SplitterWidth = 16;
+            this.splitContainerHistory.BorderStyle = BorderStyle.None;
+            this.splitContainerHistory.Panel2.Controls.Add(panelHistoryPreview);
+
+            // textBoxHistoryDetails
+            this.textBoxHistoryDetails.Dock = DockStyle.Fill;
+            this.textBoxHistoryDetails.ReadOnly = true;
+            this.textBoxHistoryDetails.ScrollBars = RichTextBoxScrollBars.Vertical;
+            this.textBoxHistoryDetails.BorderStyle = BorderStyle.None;
+            this.textBoxHistoryDetails.Text = "Select a history entry to see details...";
+
             // tabs - AntdUI card-style tabs
             this.tabs.Dock = DockStyle.Fill;
             this.tabs.Type = AntdUI.TabType.Card;
@@ -1481,8 +3349,20 @@ namespace ManageNotepadWindows
             tabBrowser.IconSvg = SvgGlobal;
             tabBrowser.Controls.Add(this.splitContainerBrowser);
 
+            var tabShells = new AntdUI.TabPage();
+            tabShells.Text = "Shells";
+            tabShells.IconSvg = SvgTerminal;
+            tabShells.Controls.Add(this.splitContainerShells);
+
+            var tabHistory = new AntdUI.TabPage();
+            tabHistory.Text = "Browser History";
+            tabHistory.IconSvg = SvgHistory;
+            tabHistory.Controls.Add(this.splitContainerHistory);
+
             this.tabs.Pages.Add(tabNotepads);
             this.tabs.Pages.Add(tabBrowser);
+            this.tabs.Pages.Add(tabShells);
+            this.tabs.Pages.Add(tabHistory);
             this.tabs.SelectedIndexChanged += (s, e) => UpdateStatus();
 
             // panelTop - styled toolbar with shadow
@@ -1536,6 +3416,12 @@ namespace ManageNotepadWindows
             this.splitContainerBrowser.Panel2.ResumeLayout(false);
             ((System.ComponentModel.ISupportInitialize)(this.splitContainerBrowser)).EndInit();
             this.splitContainerBrowser.ResumeLayout(false);
+            this.splitContainerShells.Panel2.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerShells)).EndInit();
+            this.splitContainerShells.ResumeLayout(false);
+            this.splitContainerHistory.Panel2.ResumeLayout(false);
+            ((System.ComponentModel.ISupportInitialize)(this.splitContainerHistory)).EndInit();
+            this.splitContainerHistory.ResumeLayout(false);
             this.panelTop.ResumeLayout(false);
         }
 
