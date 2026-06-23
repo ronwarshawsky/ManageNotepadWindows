@@ -6,6 +6,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Linq;
 using System.Drawing;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using System.Windows.Automation;
 using System.Net.Http;
@@ -58,6 +59,7 @@ namespace ManageNotepadWindows
         private SplitContainer splitContainer1;
         private AntdUI.Button btnFontIncrease;
         private AntdUI.Button btnFontDecrease;
+        private AntdUI.Button btnToggleTopMost;
 
         // Tab control - using AntdUI.Tabs for modern card-style tabs
         private AntdUI.Tabs tabs;
@@ -92,10 +94,29 @@ namespace ManageNotepadWindows
 
         // Notepad Tab Cache (Win11 TabState)
         private AntdUI.Table tableTabState;
+        private List<TabStateInfo> allTabStateFiles = new List<TabStateInfo>();
         private List<TabStateInfo> tabStateFiles = new List<TabStateInfo>();
         private SplitContainer splitContainerTabState;
         private RichTextBox textBoxTabStateContent;
+        private AntdUI.Button btnRestoreTabState;
+        private AntdUI.Button btnRestoreAllTabStates;
+        private AntdUI.Button btnDeleteTabStateCache;
+        private AntdUI.Button btnCancelTabStateRecovery;
+        private AntdUI.Button btnBrowseTabStateFolder;
+        private AntdUI.Button btnTabStatePreviewLayout;
+        private System.Windows.Forms.ContextMenuStrip tabStateRecoveryMenu;
+        private string customTabStateDir;
+        private bool tabStatePreviewRight = false;
         private int selectedTabStateIndex = -1;
+        private int tabStateSortColumnIndex = -1;
+        private bool tabStateSortAscending = true;
+        private bool isRecoveringNotepadBatch = false;
+        private bool hasPromptedBackupRestoreOnStartup = false;
+        private System.Threading.CancellationTokenSource activeNotepadRecoveryCancellation;
+        private const int NotepadRecoveryParallelism = 4;
+        private const int NotepadRecoveryWindowHandleAttempts = 15;
+        private const int NotepadRecoveryTextSetAttempts = 4;
+        private const int NotepadRecoveryRetryDelayMs = 250;
 
         // Status bar
         private AntdUI.Panel panelStatus;
@@ -105,6 +126,14 @@ namespace ManageNotepadWindows
         private int totalShellCount = 0;
         private int totalHistoryCount = 0;
         private int totalTabStateCount = 0;
+        private int totalTabStatePrimaryFileCount = 0;
+        private int totalTabStateDirectoryFileCount = 0;
+        private static readonly Regex TabStatePrimaryFileRegex = new Regex(
+            @"^[0-9a-fA-F-]{36}\.bin(?:\.tmp)?$",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+        private static readonly Regex TabStatePrimaryFileIdRegex = new Regex(
+            @"^(?<id>[0-9a-fA-F-]{36})\.bin(?:\.tmp)?$",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
 
         // Native helpers (consolidated)
         [DllImport("user32.dll", SetLastError = true)]
@@ -275,8 +304,19 @@ namespace ManageNotepadWindows
             public string Content { get; set; }
             public int ContentLength { get; set; }
             public DateTime LastModified { get; set; }
+            public DateTime? SourceFileDate { get; set; }
             public string Preview { get; set; }
             public string LastModifiedFormatted => LastModified.ToString("MM/dd/yy HH:mm");
+            public string SourceFileDateFormatted => SourceFileDate?.ToString("MM/dd/yy HH:mm") ?? string.Empty;
+        }
+
+        private sealed class ParsedTabStateRecord
+        {
+            public int TypeFlag { get; init; }
+            public string SourceDocumentPath { get; init; }
+            public string Content { get; init; }
+            public int ContentLength { get; init; }
+            public bool IsUnsaved { get; init; }
         }
 
         // Settings for persistence
@@ -303,9 +343,8 @@ namespace ManageNotepadWindows
             this.MaximizeBox = true;
             this.MinimizeBox = true;
 
-            // Ensure backup dir + restore
+            // Ensure backup dir exists
             if (!Directory.Exists(backupDir)) Directory.CreateDirectory(backupDir);
-            RestoreBackupNotepadContent();
 
             // Timers
             Timer backupTimer = new Timer { Interval = 5 * 60 * 1000 };
@@ -324,6 +363,7 @@ namespace ManageNotepadWindows
             MakeWindowTopMost();
             // Load event is registered in InitializeComponent
             this.FormClosing += NotepadsManager_FormClosing;
+            SystemEvents.SessionEnding += OnSessionEnding;
 
             // keyboard shortcuts
             this.KeyPreview = true;
@@ -332,6 +372,28 @@ namespace ManageNotepadWindows
 
         private void NotepadsManager_KeyDown(object sender, KeyEventArgs e)
         {
+            if (e.KeyCode == Keys.Escape && isRecoveringNotepadBatch)
+            {
+                CancelActiveNotepadRecovery();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
+
+            bool isPlainDelete = e.KeyCode == Keys.Delete && !e.Control && !e.Alt && !e.Shift;
+            if (isPlainDelete &&
+                tabs?.SelectedIndex == 4 &&
+                selectedTabStateIndex >= 0 &&
+                selectedTabStateIndex < tabStateFiles.Count &&
+                !isRecoveringNotepadBatch &&
+                (textBoxSearch == null || !textBoxSearch.ContainsFocus))
+            {
+                _ = DeleteSelectedTabStateCacheAsync();
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
+
             if (e.Control && e.KeyCode == Keys.F) { textBoxSearch.Focus(); e.Handled = true; }
             if (e.Control && e.KeyCode == Keys.Oemplus) { btnFontIncrease_Click(this, EventArgs.Empty); e.Handled = true; }
             if (e.Control && e.KeyCode == Keys.OemMinus) { btnFontDecrease_Click(this, EventArgs.Empty); e.Handled = true; }
@@ -340,6 +402,23 @@ namespace ManageNotepadWindows
         private void MakeWindowTopMost()
         {
             SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0, TOPMOST_FLAGS);
+        }
+
+        private void BtnToggleTopMost_Click(object sender, EventArgs e)
+        {
+            bool pinned = btnToggleTopMost.Type == AntdUI.TTypeMini.Primary;
+            if (pinned)
+            {
+                SetWindowPos(this.Handle, HWND_NOTOPMOST, 0, 0, 0, 0, TOPMOST_FLAGS);
+                btnToggleTopMost.Text = "Unpinned";
+                btnToggleTopMost.Type = AntdUI.TTypeMini.Default;
+            }
+            else
+            {
+                SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0, TOPMOST_FLAGS);
+                btnToggleTopMost.Text = "Pinned";
+                btnToggleTopMost.Type = AntdUI.TTypeMini.Primary;
+            }
         }
 
         private void SetupGrid()
@@ -515,11 +594,13 @@ namespace ManageNotepadWindows
                     EmptyText = "No cached Notepad tabs found"
                 };
                 tableTabState.Columns.Add(new AntdUI.Column("LastModifiedFormatted", "Modified") { Width = "120", SortOrder = true });
+                tableTabState.Columns.Add(new AntdUI.Column("SourceFileDateFormatted", "File Date") { Width = "120", SortOrder = true });
                 tableTabState.Columns.Add(new AntdUI.Column("ContentLength", "Chars") { Width = "60", SortOrder = true });
                 tableTabState.Columns.Add(new AntdUI.Column("Preview", "Content Preview") { Width = "fill", Ellipsis = true });
                 tableTabState.CellClick += TableTabState_CellClick;
                 tableTabState.CellDoubleClick += TableTabState_CellDoubleClick;
                 tableTabState.SelectIndexChanged += TableTabState_SelectIndexChanged;
+                tableTabState.SortRows += TableTabState_SortRows;
             }
 
             if (splitContainerTabState != null)
@@ -535,19 +616,60 @@ namespace ManageNotepadWindows
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "Packages", "Microsoft.WindowsNotepad_8wekyb3d8bbwe", "LocalState", "TabState");
 
+            allTabStateFiles.Clear();
             tabStateFiles.Clear();
+            totalTabStateCount = 0;
+            totalTabStatePrimaryFileCount = 0;
+            totalTabStateDirectoryFileCount = 0;
             if (!Directory.Exists(tabStateDir)) return;
 
-            var files = Directory.GetFiles(tabStateDir, "*.bin")
-                .Where(f => !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(f), @"\.\d+\.bin(\.tmp)?$"))
-                .OrderByDescending(File.GetLastWriteTime);
+            // Primary TabState records are GUID.bin / GUID.bin.tmp. Sidecars like GUID.0.bin only
+            // store cursor/config state and should not appear in the cache grid.
+            var allFiles = Directory.EnumerateFiles(tabStateDir).ToList();
+            totalTabStateDirectoryFileCount = allFiles.Count;
+
+            var files = allFiles
+                .Where(f => TabStatePrimaryFileRegex.IsMatch(Path.GetFileName(f)))
+                .OrderByDescending(File.GetLastWriteTime)
+                .ToList();
+
+            totalTabStatePrimaryFileCount = files.Count;
 
             foreach (var file in files)
             {
                 var info = ParseTabStateFile(file);
-                if (info != null) tabStateFiles.Add(info);
+                if (info != null) allTabStateFiles.Add(info);
             }
-            totalTabStateCount = tabStateFiles.Count;
+            totalTabStateCount = allTabStateFiles.Count;
+            tabStateFiles.AddRange(allTabStateFiles);
+        }
+
+        private void PopulateTabStateFromDirectory(string directory)
+        {
+            allTabStateFiles.Clear();
+            tabStateFiles.Clear();
+            totalTabStateCount = 0;
+            totalTabStatePrimaryFileCount = 0;
+            totalTabStateDirectoryFileCount = 0;
+            if (!Directory.Exists(directory)) return;
+
+            var allFiles = Directory.EnumerateFiles(directory).ToList();
+            totalTabStateDirectoryFileCount = allFiles.Count;
+
+            var files = allFiles
+                .Where(f => TabStatePrimaryFileRegex.IsMatch(Path.GetFileName(f)))
+                .OrderByDescending(File.GetLastWriteTime)
+                .ToList();
+
+            totalTabStatePrimaryFileCount = files.Count;
+
+            foreach (var file in files)
+            {
+                var info = ParseTabStateFile(file);
+                if (info != null) allTabStateFiles.Add(info);
+            }
+            totalTabStateCount = allTabStateFiles.Count;
+            tabStateFiles.AddRange(allTabStateFiles);
         }
 
         private static TabStateInfo ParseTabStateFile(string path)
@@ -561,43 +683,195 @@ namespace ManageNotepadWindows
                     fs.ReadExactly(bytes, 0, bytes.Length);
                 }
 
-                if (bytes.Length < 6 || bytes[0] != 0x4E || bytes[1] != 0x50) return null;
-                if (bytes[3] != 0x00) return null; // saved file — content is on disk
+                if (!TryParseTabStateRecord(bytes, out var record) ||
+                    (!record.IsUnsaved && record.ContentLength == 0))
+                    return null;
 
-                // Find the fixed content marker 03 01 01 01
-                int marker = -1;
-                for (int i = 4; i < bytes.Length - 4; i++)
-                    if (bytes[i] == 0x03 && bytes[i + 1] == 0x01 && bytes[i + 2] == 0x01 && bytes[i + 3] == 0x01) { marker = i; break; }
-                if (marker < 0) return null;
-
-                int pos = marker + 4;
-                int contentLen = ReadTabStateVarint(bytes, ref pos);
-                if (contentLen <= 0 || pos + contentLen * 2 > bytes.Length) return null;
-
-                string content = Encoding.Unicode.GetString(bytes, pos, contentLen * 2);
+                string content = record.Content ?? string.Empty;
                 string preview = content.Replace("\r\n", " ").Replace("\r", " ").Replace("\n", " ");
-                if (preview.Length > 150) preview = preview.Substring(0, 150) + "…";
+                if (preview.Length > 150) preview = preview.Substring(0, 149) + "…";
+                DateTime? sourceFileDate = TryGetExistingFileLastWriteTime(record.SourceDocumentPath);
 
                 return new TabStateInfo
                 {
-                    FileName = Path.GetFileNameWithoutExtension(path),
+                    FileName = !string.IsNullOrWhiteSpace(record.SourceDocumentPath)
+                        ? Path.GetFileName(record.SourceDocumentPath)
+                        : Path.GetFileName(path),
                     FilePath = path,
                     Content = content,
-                    ContentLength = contentLen,
+                    ContentLength = record.ContentLength,
                     LastModified = File.GetLastWriteTime(path),
+                    SourceFileDate = sourceFileDate,
                     Preview = preview
                 };
             }
             catch { return null; }
         }
 
-        private static int ReadTabStateVarint(byte[] bytes, ref int pos)
+        private static DateTime? TryGetExistingFileLastWriteTime(string path)
         {
-            int val = 0, shift = 0;
-            byte b;
-            do { b = bytes[pos++]; val |= (b & 0x7F) << shift; shift += 7; }
-            while ((b & 0x80) != 0 && pos < bytes.Length);
-            return val;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                    return null;
+
+                return File.GetLastWriteTime(path);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool TryParseTabStateRecord(byte[] bytes, out ParsedTabStateRecord record)
+        {
+            record = null;
+            if (bytes.Length < 4 || bytes[0] != 0x4E || bytes[1] != 0x50) return false;
+
+            int pos = 2;
+            if (!TryReadTabStateVarint64(bytes, ref pos, out _)) return false; // Sequence
+            if (!TryReadTabStateVarint(bytes, ref pos, out int typeFlag)) return false;
+
+            return typeFlag switch
+            {
+                0 => TryParseTabStateType0(bytes, pos, out record),
+                1 => TryParseTabStateType1(bytes, pos, out record),
+                _ => false
+            };
+        }
+
+        private static bool TryParseTabStateType0(byte[] bytes, int pos, out ParsedTabStateRecord record)
+        {
+            record = null;
+            if (!TryReadByte(bytes, ref pos, out _)) return false; // Unknown, observed as 1
+            if (!TryReadTabStateVarint(bytes, ref pos, out _)) return false; // SelectionStartIndex
+            if (!TryReadTabStateVarint(bytes, ref pos, out _)) return false; // SelectionEndIndex
+            if (!TryReadTabStateConfig(bytes, ref pos)) return false;
+            if (!TryReadTabStateContent(bytes, ref pos, out string content, out int contentLength, out bool isUnsaved)) return false;
+
+            record = new ParsedTabStateRecord
+            {
+                TypeFlag = 0,
+                Content = content,
+                ContentLength = contentLength,
+                IsUnsaved = isUnsaved
+            };
+            return true;
+        }
+
+        private static bool TryParseTabStateType1(byte[] bytes, int pos, out ParsedTabStateRecord record)
+        {
+            record = null;
+            if (!TryReadTabStateVarint(bytes, ref pos, out int sourcePathLength)) return false;
+            if (!TryReadTabStateUnicodeString(bytes, ref pos, sourcePathLength, out string sourcePath)) return false;
+            if (!TryReadTabStateVarint(bytes, ref pos, out _)) return false; // Saved content length
+            if (!TryReadByte(bytes, ref pos, out _)) return false; // Encoding type
+            if (!TryReadByte(bytes, ref pos, out _)) return false; // Carriage return type
+            if (!TryReadTabStateVarint64(bytes, ref pos, out _)) return false; // Timestamp / file metadata ticks
+            if (!TrySkipBytes(bytes, ref pos, 32 + 2)) return false; // File hash + unknown
+            if (!TryReadTabStateVarint(bytes, ref pos, out _)) return false; // SelectionStartIndex
+            if (!TryReadTabStateVarint(bytes, ref pos, out _)) return false; // SelectionEndIndex
+            if (!TryReadTabStateConfig(bytes, ref pos)) return false;
+            if (!TryReadTabStateContent(bytes, ref pos, out string content, out int contentLength, out bool isUnsaved)) return false;
+
+            record = new ParsedTabStateRecord
+            {
+                TypeFlag = 1,
+                SourceDocumentPath = sourcePath,
+                Content = content,
+                ContentLength = contentLength,
+                IsUnsaved = isUnsaved
+            };
+            return true;
+        }
+
+        private static bool TryReadTabStateConfig(byte[] bytes, ref int pos)
+        {
+            if (!TrySkipBytes(bytes, ref pos, 3)) return false; // WordWrap, RightToLeft, ShowUnicode
+            if (!TryReadTabStateVarint(bytes, ref pos, out int moreOptionsLength)) return false;
+            return TrySkipBytes(bytes, ref pos, moreOptionsLength);
+        }
+
+        private static bool TryReadTabStateContent(byte[] bytes, ref int pos, out string content, out int contentLength, out bool isUnsaved)
+        {
+            content = string.Empty;
+            contentLength = 0;
+            isUnsaved = false;
+
+            if (!TryReadTabStateVarint(bytes, ref pos, out contentLength)) return false;
+            if (!TryReadTabStateUnicodeString(bytes, ref pos, contentLength, out content)) return false;
+            if (!TryReadByte(bytes, ref pos, out byte unsavedMarker)) return false;
+            if (!TrySkipBytes(bytes, ref pos, 4)) return false; // CRC32
+
+            isUnsaved = unsavedMarker != 0;
+            return true;
+        }
+
+        private static bool TryReadTabStateUnicodeString(byte[] bytes, ref int pos, int charCount, out string value)
+        {
+            value = string.Empty;
+            if (charCount < 0) return false;
+
+            long byteCount = (long)charCount * 2;
+            if (byteCount > int.MaxValue || pos + byteCount > bytes.Length) return false;
+
+            value = charCount == 0
+                ? string.Empty
+                : Encoding.Unicode.GetString(bytes, pos, (int)byteCount);
+
+            pos += (int)byteCount;
+            return true;
+        }
+
+        private static bool TryReadByte(byte[] bytes, ref int pos, out byte value)
+        {
+            value = 0;
+            if (pos >= bytes.Length) return false;
+            value = bytes[pos++];
+            return true;
+        }
+
+        private static bool TrySkipBytes(byte[] bytes, ref int pos, int count)
+        {
+            if (count < 0 || pos + count > bytes.Length) return false;
+            pos += count;
+            return true;
+        }
+
+        private static bool TryReadTabStateVarint(byte[] bytes, ref int pos, out int value)
+        {
+            value = 0;
+            if (!TryReadTabStateVarint64(bytes, ref pos, out long longValue) || longValue > int.MaxValue)
+                return false;
+
+            value = (int)longValue;
+            return true;
+        }
+
+        private static bool TryReadTabStateVarint64(byte[] bytes, ref int pos, out long value)
+        {
+            value = 0;
+            ulong result = 0;
+            int shift = 0;
+
+            while (pos < bytes.Length && shift <= 63)
+            {
+                byte b = bytes[pos++];
+                ulong chunk = (ulong)(b & 0x7F);
+                if (shift == 63 && chunk > 1) return false;
+
+                result |= chunk << shift;
+                if ((b & 0x80) == 0)
+                {
+                    if (result > long.MaxValue) return false;
+                    value = (long)result;
+                    return true;
+                }
+
+                shift += 7;
+            }
+
+            return false;
         }
 
         private void RefreshTabStateTable()
@@ -605,6 +879,7 @@ namespace ManageNotepadWindows
             if (tableTabState == null) return;
             tableTabState.DataSource = null;
             tableTabState.DataSource = new List<TabStateInfo>(tabStateFiles);
+            SetSelectedTabStateItem(null);
         }
 
         private void TableTabState_SelectIndexChanged(object sender, EventArgs e)
@@ -612,36 +887,685 @@ namespace ManageNotepadWindows
             int idx = tableTabState?.SelectedIndex ?? -1;
             if (idx > 0)
             {
-                selectedTabStateIndex = idx - 1;
-                if (selectedTabStateIndex < tabStateFiles.Count)
-                    textBoxTabStateContent.Text = tabStateFiles[selectedTabStateIndex].Content ?? string.Empty;
+                int rowIndex = idx - 1;
+                if (rowIndex >= 0 && rowIndex < tabStateFiles.Count)
+                {
+                    SetSelectedTabStateItem(tabStateFiles[rowIndex]);
+                    return;
+                }
             }
+
+            SetSelectedTabStateItem(null);
         }
 
-        private void TableTabState_CellClick(object sender, AntdUI.TableClickEventArgs e) { }
+        private void TableTabState_CellClick(object sender, AntdUI.TableClickEventArgs e)
+        {
+            if (e.Record is TabStateInfo item)
+                SetSelectedTabStateItem(item);
+        }
 
         private void TableTabState_CellDoubleClick(object sender, AntdUI.TableClickEventArgs e)
         {
-            if (e.Record is TabStateInfo item) RestoreTabState(item);
+            if (e.Record is TabStateInfo item)
+                _ = RestoreSingleTabStateAsync(item);
         }
 
-        private void RestoreTabState(TabStateInfo item)
+        private async void BtnDeleteTabStateCache_Click(object sender, EventArgs e)
         {
-            if (string.IsNullOrWhiteSpace(item?.Content)) return;
+            await DeleteSelectedTabStateCacheAsync();
+        }
+
+        private async System.Threading.Tasks.Task DeleteSelectedTabStateCacheAsync()
+        {
+            if (isRecoveringNotepadBatch) return;
+
+            if (selectedTabStateIndex < 0 || selectedTabStateIndex >= tabStateFiles.Count)
+            {
+                MessageBox.Show(
+                    this,
+                    "Select a cached tab first.",
+                    "Delete Cache File",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            var item = tabStateFiles[selectedTabStateIndex];
+            var filesToDelete = GetTabStateFilesToDelete(item.FilePath);
+            if (filesToDelete.Count == 0)
+            {
+                MessageBox.Show(
+                    this,
+                    "The selected cache file could not be resolved.",
+                    "Delete Cache File",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+                return;
+            }
+
+            string prompt = filesToDelete.Count == 1
+                ? $"Delete this Windows Notepad cache file?{Environment.NewLine}{Environment.NewLine}{item.FileName}"
+                : $"Delete this cached tab and {filesToDelete.Count - 1} related TabState file{(filesToDelete.Count == 2 ? string.Empty : "s")}?{Environment.NewLine}{Environment.NewLine}{item.FileName}";
+
+            var confirm = MessageBox.Show(
+                this,
+                prompt,
+                "Delete Cache File",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes) return;
+
+            SetTabStateActionButtonsEnabled(false);
+            UpdateStatus("Deleting cache file...");
+
+            var failedFiles = new List<string>();
             try
             {
-                var notepad = Process.Start("notepad.exe");
-                if (notepad == null || !notepad.WaitForInputIdle(5000)) return;
-                IntPtr hwnd = IntPtr.Zero;
-                for (int i = 0; i < 10 && hwnd == IntPtr.Zero; i++)
+                foreach (string file in filesToDelete)
                 {
-                    System.Threading.Thread.Sleep(200);
-                    notepad.Refresh();
-                    hwnd = notepad.MainWindowHandle;
+                    try
+                    {
+                        if (File.Exists(file))
+                            File.Delete(file);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"Delete cache file failed for {file}: {ex.Message}");
+                        failedFiles.Add(file);
+                    }
                 }
-                if (hwnd != IntPtr.Zero) TrySetNotepadText(hwnd, item.Content);
+
+                if (customTabStateDir != null)
+                    await System.Threading.Tasks.Task.Run(() => PopulateTabStateFromDirectory(customTabStateDir));
+                else
+                    await System.Threading.Tasks.Task.Run(() => PopulateTabState());
+                if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                    await PerformTabStateSearchAsync();
+                else
+                {
+                    ApplyCurrentTabStateSortIfNeeded();
+                    EnsureTabStateSplitterDistance();
+                    UpdateStatus();
+                }
+
+                if (failedFiles.Count > 0)
+                {
+                    string failedList = string.Join(Environment.NewLine, failedFiles.Take(3).Select(Path.GetFileName));
+                    if (failedFiles.Count > 3)
+                        failedList += $"{Environment.NewLine}...";
+
+                    MessageBox.Show(
+                        this,
+                        $"Some TabState files could not be deleted.{Environment.NewLine}{Environment.NewLine}{failedList}",
+                        "Delete Cache File",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
             }
-            catch (Exception ex) { Debug.WriteLine($"RestoreTabState error: {ex.Message}"); }
+            finally
+            {
+                SetTabStateActionButtonsEnabled(true);
+                UpdateStatus();
+            }
+        }
+
+        private static List<string> GetTabStateFilesToDelete(string primaryFilePath)
+        {
+            var results = new List<string>();
+            if (string.IsNullOrWhiteSpace(primaryFilePath))
+                return results;
+
+            string directory = Path.GetDirectoryName(primaryFilePath);
+            string fileName = Path.GetFileName(primaryFilePath);
+            if (string.IsNullOrWhiteSpace(directory) || string.IsNullOrWhiteSpace(fileName))
+                return results;
+
+            var match = TabStatePrimaryFileIdRegex.Match(fileName);
+            if (!match.Success)
+            {
+                if (File.Exists(primaryFilePath))
+                    results.Add(primaryFilePath);
+                return results;
+            }
+
+            string recordId = match.Groups["id"].Value;
+            if (!Directory.Exists(directory))
+                return results;
+
+            foreach (string candidate in Directory.EnumerateFiles(directory, $"{recordId}*"))
+            {
+                string candidateName = Path.GetFileName(candidate);
+                if (candidateName.StartsWith(recordId + ".", StringComparison.OrdinalIgnoreCase))
+                    results.Add(candidate);
+            }
+
+            return results
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(path => path.Equals(primaryFilePath, StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                .ThenBy(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private async System.Threading.Tasks.Task RestoreSingleTabStateAsync(TabStateInfo item)
+        {
+            if (item == null || isRecoveringNotepadBatch) return;
+
+            SetTabStateActionButtonsEnabled(false);
+            try
+            {
+                UpdateStatus("Opening Notepad...");
+                bool restored = await System.Threading.Tasks.Task.Run(() => RestoreTabState(item, System.Threading.CancellationToken.None));
+                if (!restored)
+                {
+                    MessageBox.Show(this,
+                        "Failed to restore the selected Notepad content.",
+                        "Open in Notepad",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+                }
+            }
+            finally
+            {
+                SetTabStateActionButtonsEnabled(true);
+                UpdateStatus();
+            }
+        }
+
+        private bool RestoreTabState(TabStateInfo item, System.Threading.CancellationToken cancellationToken)
+        {
+            if (!TryOpenNotepadWithContent(item?.Content, item?.FileName, cancellationToken, out IntPtr hwnd)) return false;
+
+            if (hwnd != IntPtr.Zero)
+                WriteBackupSnapshot(hwnd, item.Content);
+            return true;
+        }
+
+        private void BtnRestoreAllTabStates_Click(object sender, EventArgs e)
+        {
+            if (tabStateRecoveryMenu == null || btnRestoreAllTabStates == null || !btnRestoreAllTabStates.Enabled) return;
+            tabStateRecoveryMenu.Show(btnRestoreAllTabStates, new Point(0, btnRestoreAllTabStates.Height));
+        }
+
+        private async void OpenAllSystemCacheNotepadsMenuItem_Click(object sender, EventArgs e)
+        {
+            await RestoreAllTabStatesAsync();
+        }
+
+        private async void OpenAllBackupNotepadsMenuItem_Click(object sender, EventArgs e)
+        {
+            await RestoreBackupNotepadContentAsync(
+                promptBeforeRestoring: true,
+                showSummary: true,
+                showNoBackupsMessage: true,
+                title: "Open All Backup Notepads");
+        }
+
+        private async System.Threading.Tasks.Task RestoreAllTabStatesAsync()
+        {
+            if (isRecoveringNotepadBatch) return;
+
+            var items = tabStateFiles
+                .Where(t => !string.IsNullOrWhiteSpace(t.Content))
+                .ToList();
+            if (items.Count == 0)
+            {
+                MessageBox.Show(this, "There are no system cache notepads to restore.", "System Cache Notepads",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            var result = MessageBox.Show(
+                this,
+                $"Open {items.Count} system cache notepad{(items.Count == 1 ? "" : "s")} in separate Notepad windows?{Environment.NewLine}{Environment.NewLine}" +
+                $"Open runs in parallel groups and can be cancelled with Esc or Cancel.{Environment.NewLine}{Environment.NewLine}" +
+                $"Each restored tab will also be written immediately to:{Environment.NewLine}{backupDir}",
+                "Open All System Cache Notepads",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (result != DialogResult.Yes) return;
+
+            int restoredCount = await RunNotepadRecoveryBatchAsync(
+                items,
+                (item, cancellationToken) => RestoreTabState(item, cancellationToken),
+                "Opening system cache notepads...");
+
+            MessageBox.Show(
+                this,
+                BuildRecoverySummary(restoredCount, items.Count, "system cache notepad"),
+                "Open All System Cache Notepads",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        private void BtnTabStatePreviewLayout_Click(object sender, EventArgs e)
+        {
+            tabStatePreviewRight = !tabStatePreviewRight;
+            btnTabStatePreviewLayout.Text = tabStatePreviewRight ? "Preview Bottom" : "Preview Right";
+
+            if (tabStatePreviewRight)
+            {
+                splitContainerTabState.Orientation = Orientation.Vertical;
+                splitContainerTabState.Panel1MinSize = 300;
+                splitContainerTabState.Panel2MinSize = 200;
+                int preferred = (int)(splitContainerTabState.Width * 0.55);
+                int maxLeft = splitContainerTabState.Width - splitContainerTabState.SplitterWidth - 200;
+                splitContainerTabState.SplitterDistance = Math.Min(maxLeft, Math.Max(300, preferred));
+            }
+            else
+            {
+                splitContainerTabState.Orientation = Orientation.Horizontal;
+                EnsureTabStateSplitterDistance();
+            }
+        }
+
+        private async void BtnBrowseTabStateFolder_Click(object sender, EventArgs e)
+        {
+            if (customTabStateDir != null)
+            {
+                customTabStateDir = null;
+                btnBrowseTabStateFolder.Text = "Browse Folder...";
+                btnBrowseTabStateFolder.Type = AntdUI.TTypeMini.Default;
+                btnDeleteTabStateCache.Visible = true;
+                await System.Threading.Tasks.Task.Run(() => PopulateTabState());
+                if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                    await PerformTabStateSearchAsync();
+                else
+                    ApplyCurrentTabStateSortIfNeeded();
+                EnsureTabStateSplitterDistance();
+                UpdateStatus();
+                return;
+            }
+
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog())
+            {
+                dialog.Description = "Select a folder containing Notepad TabState (.bin) files";
+                dialog.UseDescriptionForTitle = true;
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+
+                string selectedDir = dialog.SelectedPath;
+                SetTabStateActionButtonsEnabled(false);
+                UpdateStatus("Loading TabState files from folder...");
+
+                await System.Threading.Tasks.Task.Run(() => PopulateTabStateFromDirectory(selectedDir));
+
+                if (allTabStateFiles.Count == 0)
+                {
+                    MessageBox.Show(this,
+                        "No valid Notepad TabState files found in the selected folder.",
+                        "Browse Folder",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    await System.Threading.Tasks.Task.Run(() => PopulateTabState());
+                    if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                        await PerformTabStateSearchAsync();
+                    else
+                        ApplyCurrentTabStateSortIfNeeded();
+                    EnsureTabStateSplitterDistance();
+                    UpdateStatus();
+                    SetTabStateActionButtonsEnabled(true);
+                    return;
+                }
+
+                customTabStateDir = selectedDir;
+                btnBrowseTabStateFolder.Text = "Back to System Cache";
+                btnBrowseTabStateFolder.Type = AntdUI.TTypeMini.Warn;
+                btnDeleteTabStateCache.Visible = false;
+                if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                    await PerformTabStateSearchAsync();
+                else
+                    ApplyCurrentTabStateSortIfNeeded();
+                EnsureTabStateSplitterDistance();
+                UpdateStatus();
+                SetTabStateActionButtonsEnabled(true);
+            }
+        }
+
+        private void SetTabStateActionButtonsEnabled(bool enabled)
+        {
+            if (btnRestoreTabState != null) btnRestoreTabState.Enabled = enabled;
+            if (btnRestoreAllTabStates != null) btnRestoreAllTabStates.Enabled = enabled;
+            if (btnDeleteTabStateCache != null) btnDeleteTabStateCache.Enabled = enabled;
+            if (btnBrowseTabStateFolder != null) btnBrowseTabStateFolder.Enabled = enabled;
+            if (btnCancelTabStateRecovery != null)
+            {
+                bool showCancel = !enabled && isRecoveringNotepadBatch;
+                btnCancelTabStateRecovery.Visible = showCancel;
+                btnCancelTabStateRecovery.Enabled = showCancel;
+            }
+        }
+
+        private async System.Threading.Tasks.Task<int> RunNotepadRecoveryBatchAsync<T>(
+            IReadOnlyList<T> items,
+            Func<T, System.Threading.CancellationToken, bool> restoreFunc,
+            string progressPrefix)
+        {
+            if (items == null || items.Count == 0) return 0;
+
+            isRecoveringNotepadBatch = true;
+            activeNotepadRecoveryCancellation = new System.Threading.CancellationTokenSource();
+            var cancellationToken = activeNotepadRecoveryCancellation.Token;
+            int restoredCount = 0;
+            int completedCount = 0;
+
+            SetTabStateActionButtonsEnabled(false);
+            PostRecoveryStatus($"{progressPrefix} 0/{items.Count} (Esc to cancel)");
+
+            try
+            {
+                foreach (var chunk in items.Chunk(NotepadRecoveryParallelism))
+                {
+                    if (cancellationToken.IsCancellationRequested) break;
+
+                    var tasks = chunk
+                        .Select(item => System.Threading.Tasks.Task.Run(() =>
+                        {
+                            bool restored = false;
+                            if (!cancellationToken.IsCancellationRequested)
+                                restored = restoreFunc(item, cancellationToken);
+
+                            int finished = System.Threading.Interlocked.Increment(ref completedCount);
+                            PostRecoveryStatus($"{progressPrefix} {finished}/{items.Count} (Esc to cancel)");
+                            return restored;
+                        }, cancellationToken))
+                        .ToArray();
+
+                    bool[] chunkResults;
+                    try
+                    {
+                        chunkResults = await System.Threading.Tasks.Task.WhenAll(tasks);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+
+                    restoredCount += chunkResults.Count(r => r);
+                }
+            }
+            finally
+            {
+                activeNotepadRecoveryCancellation?.Dispose();
+                activeNotepadRecoveryCancellation = null;
+                isRecoveringNotepadBatch = false;
+                SetTabStateActionButtonsEnabled(true);
+                UpdateStatus();
+            }
+
+            return restoredCount;
+        }
+
+        private static string BuildRecoverySummary(int restoredCount, int totalCount, string noun)
+        {
+            if (restoredCount == totalCount)
+                return $"Opened {restoredCount} of {totalCount} {noun}{(totalCount == 1 ? string.Empty : "s")} in Notepad.";
+
+            return $"Opened {restoredCount} of {totalCount} {noun}{(totalCount == 1 ? string.Empty : "s")} in Notepad." +
+                $"{Environment.NewLine}Some items were cancelled or failed to restore.";
+        }
+
+        private void SetSelectedTabStateItem(TabStateInfo item)
+        {
+            if (item == null)
+            {
+                selectedTabStateIndex = -1;
+                if (textBoxTabStateContent != null)
+                    textBoxTabStateContent.Text = string.Empty;
+                return;
+            }
+
+            selectedTabStateIndex = tabStateFiles.IndexOf(item);
+            if (textBoxTabStateContent != null)
+                textBoxTabStateContent.Text = item.Content ?? string.Empty;
+        }
+
+        private void CancelActiveNotepadRecovery()
+        {
+            if (!isRecoveringNotepadBatch) return;
+
+            try
+            {
+                activeNotepadRecoveryCancellation?.Cancel();
+                UpdateStatus("Cancelling notepad recovery...");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"CancelActiveNotepadRecovery error: {ex.Message}");
+            }
+        }
+
+        private void PostRecoveryStatus(string message)
+        {
+            try
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke(new Action(() =>
+                {
+                    if (!IsDisposed) UpdateStatus(message);
+                }));
+            }
+            catch { }
+        }
+
+        private bool TryOpenNotepadWithContent(string content, string preferredFileName, System.Threading.CancellationToken cancellationToken, out IntPtr hwnd)
+        {
+            hwnd = IntPtr.Zero;
+            if (string.IsNullOrWhiteSpace(content)) return false;
+
+            Process notepad = null;
+            try
+            {
+                notepad = Process.Start("notepad.exe");
+                if (notepad == null) return false;
+
+                try { notepad.WaitForInputIdle(5000); } catch { }
+                if (!TryResolveLaunchedNotepadWindowHandle(notepad, cancellationToken, null, out hwnd))
+                {
+                    TryTerminateLaunchedNotepad(notepad);
+                    return TryOpenNotepadWithRecoveryFile(content, preferredFileName, cancellationToken, out hwnd);
+                }
+
+                for (int i = 0; i < NotepadRecoveryTextSetAttempts && !cancellationToken.IsCancellationRequested; i++)
+                {
+                    if (TrySetNotepadText(hwnd, content) && DoesNotepadContainExpectedText(hwnd, content))
+                        return true;
+
+                    System.Threading.Thread.Sleep(NotepadRecoveryRetryDelayMs);
+                    TryResolveLaunchedNotepadWindowHandle(notepad, cancellationToken, null, out hwnd);
+                }
+
+                TryTerminateLaunchedNotepad(notepad);
+                return TryOpenNotepadWithRecoveryFile(content, preferredFileName, cancellationToken, out hwnd);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TryOpenNotepadWithContent error: {ex.Message}");
+                TryTerminateLaunchedNotepad(notepad);
+                return TryOpenNotepadWithRecoveryFile(content, preferredFileName, cancellationToken, out hwnd);
+            }
+        }
+
+        private bool TryOpenNotepadWithRecoveryFile(string content, string preferredFileName, System.Threading.CancellationToken cancellationToken, out IntPtr hwnd)
+        {
+            hwnd = IntPtr.Zero;
+            if (string.IsNullOrWhiteSpace(content) || cancellationToken.IsCancellationRequested) return false;
+
+            try
+            {
+                string recoveryPath = WriteRecoveryFile(content, preferredFileName);
+                var existingNotepadHandles = GetOpenNotepadHandles();
+
+                var startInfo = new ProcessStartInfo("notepad.exe")
+                {
+                    Arguments = $"\"{recoveryPath}\"",
+                    UseShellExecute = true,
+                    WorkingDirectory = Path.GetDirectoryName(recoveryPath)
+                };
+
+                var notepad = Process.Start(startInfo);
+                if (notepad == null) return false;
+
+                try { notepad.WaitForInputIdle(5000); } catch { }
+
+                // Opening a file can reuse an existing Notepad window/tab, so a window handle is
+                // best-effort here. The recovery file itself is the durable fallback.
+                TryResolveLaunchedNotepadWindowHandle(notepad, cancellationToken, existingNotepadHandles, out hwnd);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"TryOpenNotepadWithRecoveryFile error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private bool TryResolveLaunchedNotepadWindowHandle(
+            Process notepad,
+            System.Threading.CancellationToken cancellationToken,
+            HashSet<long> existingNotepadHandles,
+            out IntPtr hwnd)
+        {
+            hwnd = IntPtr.Zero;
+
+            for (int i = 0; i < NotepadRecoveryWindowHandleAttempts && !cancellationToken.IsCancellationRequested; i++)
+            {
+                System.Threading.Thread.Sleep(NotepadRecoveryRetryDelayMs);
+
+                try
+                {
+                    if (notepad != null && !notepad.HasExited)
+                    {
+                        notepad.Refresh();
+                        hwnd = notepad.MainWindowHandle;
+                        if (!IsNotepadWindow(hwnd))
+                            hwnd = FindWindowForProcess(notepad.Id);
+                    }
+                }
+                catch { }
+
+                if (IsNotepadWindow(hwnd))
+                    return true;
+
+                if (existingNotepadHandles != null)
+                {
+                    long newHandle = GetOpenNotepadHandles().FirstOrDefault(h => !existingNotepadHandles.Contains(h));
+                    if (newHandle != 0)
+                    {
+                        hwnd = new IntPtr(newHandle);
+                        return true;
+                    }
+                }
+
+                IntPtr foreground = GetForegroundWindow();
+                if (IsNotepadWindow(foreground))
+                {
+                    hwnd = foreground;
+                    return true;
+                }
+            }
+
+            hwnd = IntPtr.Zero;
+            return false;
+        }
+
+        private bool IsNotepadWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+
+            var cls = new StringBuilder(256);
+            GetClassName(hwnd, cls, cls.Capacity);
+            string className = cls.ToString();
+            return className == "Notepad" || className == "CascadiaWindow";
+        }
+
+        private void TryTerminateLaunchedNotepad(Process notepad)
+        {
+            if (notepad == null) return;
+
+            try
+            {
+                if (notepad.HasExited) return;
+                if (!notepad.CloseMainWindow() || !notepad.WaitForExit(1000))
+                {
+                    notepad.Kill(true);
+                    notepad.WaitForExit(2000);
+                }
+            }
+            catch
+            {
+                try
+                {
+                    if (!notepad.HasExited)
+                        notepad.Kill(true);
+                }
+                catch { }
+            }
+        }
+
+        private string WriteRecoveryFile(string content, string preferredFileName)
+        {
+            string recoveryDir = Path.Combine(backupDir, "RecoveredSystemCache");
+            Directory.CreateDirectory(recoveryDir);
+
+            string fileName = BuildRecoveryFileName(preferredFileName);
+            string recoveryPath = Path.Combine(recoveryDir, fileName);
+            File.WriteAllText(recoveryPath, content, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+            return recoveryPath;
+        }
+
+        private string BuildRecoveryFileName(string preferredFileName)
+        {
+            string candidate = Path.GetFileName(preferredFileName);
+            if (string.IsNullOrWhiteSpace(candidate) || TabStatePrimaryFileRegex.IsMatch(candidate))
+                candidate = "RecoveredNotepad.txt";
+
+            string baseName = Path.GetFileNameWithoutExtension(candidate);
+            if (string.IsNullOrWhiteSpace(baseName))
+                baseName = "RecoveredNotepad";
+
+            foreach (char invalidChar in Path.GetInvalidFileNameChars())
+                baseName = baseName.Replace(invalidChar, '_');
+
+            string extension = Path.GetExtension(candidate);
+            if (string.IsNullOrWhiteSpace(extension) ||
+                extension.Equals(".bin", StringComparison.OrdinalIgnoreCase) ||
+                extension.Equals(".tmp", StringComparison.OrdinalIgnoreCase))
+            {
+                extension = ".txt";
+            }
+
+            return $"{baseName}_{DateTime.Now:yyyyMMdd_HHmmss_fff}{extension}";
+        }
+
+        private bool DoesNotepadContainExpectedText(IntPtr hwnd, string expectedContent)
+        {
+            if (hwnd == IntPtr.Zero || string.IsNullOrWhiteSpace(expectedContent))
+                return false;
+
+            try
+            {
+                string actual = GetNotepadTextModern(hwnd);
+                if (IsNotepadTextError(actual))
+                    return false;
+
+                return string.Equals(
+                    NormalizeNotepadTextForComparison(actual),
+                    NormalizeNotepadTextForComparison(expectedContent),
+                    StringComparison.Ordinal);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"DoesNotepadContainExpectedText error: {ex.Message}");
+                return false;
+            }
+        }
+
+        private static string NormalizeNotepadTextForComparison(string text)
+        {
+            if (text == null) return string.Empty;
+
+            return text
+                .Replace("\0", string.Empty)
+                .Replace("\r\n", "\n")
+                .Replace("\r", "\n");
         }
 
         // Track selected row indices for AntdUI.Table
@@ -2190,8 +3114,7 @@ namespace ManageNotepadWindows
                     string content = ExtractNotepadContentForBackup(hWnd, clsStr);
                     if (IsNotepadTextError(content)) return true;
 
-                    string backupPath = Path.Combine(backupDir, $"NotepadBackup_{hWnd.ToInt64()}.txt");
-                    File.WriteAllText(backupPath, content);
+                    WriteBackupSnapshot(hWnd, content);
                 }
                 catch (Exception ex) { Debug.WriteLine($"Backup error for hWnd {hWnd}: {ex.Message}"); }
                 return true;
@@ -2200,38 +3123,155 @@ namespace ManageNotepadWindows
             CleanupObsoleteBackups();
         }
 
+        private void WriteBackupSnapshot(IntPtr hwnd, string content)
+        {
+            if (hwnd == IntPtr.Zero || string.IsNullOrWhiteSpace(content)) return;
+
+            try
+            {
+                Directory.CreateDirectory(backupDir);
+                string backupPath = Path.Combine(backupDir, $"NotepadBackup_{hwnd.ToInt64()}.txt");
+                File.WriteAllText(backupPath, content);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error writing backup snapshot for {hwnd}: {ex.Message}");
+            }
+        }
+
         private void CleanupObsoleteBackups()
         {
-            var openHwnds = new HashSet<long>();
-            EnumWindows((hWnd, lParam) =>
-            {
-                try
-                {
-                    if (!IsWindowVisible(hWnd)) return true;
-                    var cls = new StringBuilder(256);
-                    GetClassName(hWnd, cls, cls.Capacity);
-                    var clsStr = cls.ToString();
-                    if (clsStr == "Notepad" || clsStr == "CascadiaWindow")
-                        openHwnds.Add(hWnd.ToInt64());
-                }
-                catch { }
-                return true;
-            }, IntPtr.Zero);
+            var openHwnds = GetOpenNotepadHandles();
 
             foreach (var f in Directory.GetFiles(backupDir, "NotepadBackup_*.txt"))
             {
                 try
                 {
-                    var name = Path.GetFileNameWithoutExtension(f);
-                    var parts = name.Split('_');
-                    if (parts.Length < 2 || !long.TryParse(parts[1], out long hwndVal)) continue;
+                    if (!TryGetBackupWindowHandle(f, out long hwndVal)) continue;
                     if (!openHwnds.Contains(hwndVal)) File.Delete(f);
                 }
                 catch (Exception ex) { Debug.WriteLine($"Error deleting backup {f}: {ex.Message}"); }
             }
         }
 
-        private void RestoreBackupNotepadContent()
+        private async System.Threading.Tasks.Task PromptToRestoreBackupNotepadContentOnStartupAsync()
+        {
+            if (hasPromptedBackupRestoreOnStartup) return;
+            hasPromptedBackupRestoreOnStartup = true;
+
+            int pendingCount = GetPendingBackupRestoreCount();
+            if (pendingCount == 0) return;
+
+            var result = MessageBox.Show(
+                this,
+                $"Restore {pendingCount} backup notepad{(pendingCount == 1 ? "" : "s")} from:{Environment.NewLine}{backupDir}{Environment.NewLine}{Environment.NewLine}" +
+                "These are fallback snapshots saved by this app, not the Windows Notepad system cache.",
+                "Restore Backup Notepads on Startup",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+            if (result != DialogResult.Yes) return;
+
+            await RestoreBackupNotepadContentAsync(
+                promptBeforeRestoring: false,
+                showSummary: false,
+                showNoBackupsMessage: false,
+                title: "Restore Backup Notepads on Startup");
+        }
+
+        private async System.Threading.Tasks.Task RestoreBackupNotepadContentAsync(
+            bool promptBeforeRestoring,
+            bool showSummary,
+            bool showNoBackupsMessage,
+            string title)
+        {
+            var backupFiles = GetPendingBackupRestoreFiles();
+            if (backupFiles.Count == 0)
+            {
+                if (showNoBackupsMessage)
+                {
+                    MessageBox.Show(this, "There are no backup notepads waiting to be restored.", title,
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                return;
+            }
+
+            if (promptBeforeRestoring)
+            {
+                var result = MessageBox.Show(
+                    this,
+                    $"Open {backupFiles.Count} backup notepad{(backupFiles.Count == 1 ? "" : "s")} in separate Notepad windows?{Environment.NewLine}{Environment.NewLine}" +
+                    $"Open runs in parallel groups and can be cancelled with Esc or Cancel.{Environment.NewLine}{Environment.NewLine}" +
+                    $"Source folder:{Environment.NewLine}{backupDir}",
+                    title,
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+                if (result != DialogResult.Yes) return;
+            }
+
+            int restoredCount = await RunNotepadRecoveryBatchAsync(
+                backupFiles,
+                (backupFile, cancellationToken) => TryRestoreBackupNotepad(backupFile, cancellationToken),
+                "Opening backup notepads...");
+
+            if (showSummary)
+            {
+                MessageBox.Show(
+                    this,
+                    BuildRecoverySummary(restoredCount, backupFiles.Count, "backup notepad"),
+                    title,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+            }
+        }
+
+        private int GetPendingBackupRestoreCount() => GetPendingBackupRestoreFiles().Count;
+
+        private List<string> GetPendingBackupRestoreFiles()
+        {
+            if (!Directory.Exists(backupDir)) return new List<string>();
+
+            var openHwnds = GetOpenNotepadHandles();
+            var result = new List<string>();
+            foreach (var backupFile in Directory.GetFiles(backupDir, "NotepadBackup_*.txt"))
+            {
+                if (!TryGetBackupWindowHandle(backupFile, out long hwndVal) || openHwnds.Contains(hwndVal))
+                    continue;
+
+                result.Add(backupFile);
+            }
+            return result;
+        }
+
+        private bool TryRestoreBackupNotepad(string backupFile, System.Threading.CancellationToken cancellationToken)
+        {
+            try
+            {
+                string content = File.ReadAllText(backupFile);
+                if (string.IsNullOrWhiteSpace(content))
+                {
+                    File.Delete(backupFile);
+                    return false;
+                }
+
+                if (!TryOpenNotepadWithContent(content, Path.GetFileName(backupFile), cancellationToken, out IntPtr hwnd)) return false;
+
+                if (hwnd == IntPtr.Zero)
+                    return true;
+
+                string newBackupPath = Path.Combine(backupDir, $"NotepadBackup_{hwnd.ToInt64()}.txt");
+                WriteBackupSnapshot(hwnd, content);
+                if (!string.Equals(backupFile, newBackupPath, StringComparison.OrdinalIgnoreCase))
+                    File.Delete(backupFile);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error restoring backup {backupFile}: {ex.Message}");
+                return false;
+            }
+        }
+
+        private HashSet<long> GetOpenNotepadHandles()
         {
             var openHwnds = new HashSet<long>();
             EnumWindows((hWnd, lParam) =>
@@ -2249,35 +3289,15 @@ namespace ManageNotepadWindows
                 return true;
             }, IntPtr.Zero);
 
-            foreach (var backupFile in Directory.GetFiles(backupDir, "NotepadBackup_*.txt"))
-            {
-                try
-                {
-                    var name = Path.GetFileNameWithoutExtension(backupFile);
-                    var parts = name.Split('_');
-                    if (parts.Length < 2 || !long.TryParse(parts[1], out long hwndVal)) continue;
-                    if (openHwnds.Contains(hwndVal)) continue;
+            return openHwnds;
+        }
 
-                    string content = File.ReadAllText(backupFile);
-                    if (string.IsNullOrWhiteSpace(content)) { File.Delete(backupFile); continue; }
-
-                    var notepad = Process.Start("notepad.exe");
-                    if (notepad == null || !notepad.WaitForInputIdle(5000)) continue;
-
-                    IntPtr hwnd = IntPtr.Zero;
-                    for (int i = 0; i < 10 && hwnd == IntPtr.Zero; i++)
-                    {
-                        System.Threading.Thread.Sleep(200);
-                        notepad.Refresh();
-                        hwnd = notepad.MainWindowHandle;
-                    }
-                    if (hwnd == IntPtr.Zero) continue;
-
-                    if (TrySetNotepadText(hwnd, content))
-                        File.Delete(backupFile);
-                }
-                catch (Exception ex) { Debug.WriteLine($"Error restoring backup {backupFile}: {ex.Message}"); }
-            }
+        private static bool TryGetBackupWindowHandle(string backupFile, out long hwndVal)
+        {
+            hwndVal = 0;
+            var name = Path.GetFileNameWithoutExtension(backupFile);
+            var parts = name.Split('_');
+            return parts.Length >= 2 && long.TryParse(parts[1], out hwndVal);
         }
 
         private string ExtractNotepadContentForBackup(IntPtr hWnd, string windowClass)
@@ -2301,14 +3321,18 @@ namespace ManageNotepadWindows
 
         private bool TrySetNotepadText(IntPtr hwnd, string content)
         {
+            bool TrySetTextViaWin32(IntPtr targetHandle)
+            {
+                if (targetHandle == IntPtr.Zero) return false;
+                IntPtr result;
+                IntPtr sendResult = SendMessageTimeout(targetHandle, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content), SMTO_ABORTIFHUNG, 2000, out result);
+                return sendResult != IntPtr.Zero;
+            }
+
             // Classic Notepad: Edit child control
             IntPtr edit = FindWindowEx(hwnd, IntPtr.Zero, "Edit", null);
-            if (edit != IntPtr.Zero)
-            {
-                IntPtr result;
-                SendMessageTimeout(edit, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content), SMTO_ABORTIFHUNG, 2000, out result);
+            if (TrySetTextViaWin32(edit))
                 return true;
-            }
 
             // Win11 Notepad: search for RichEdit child classes
             string[] richEditClasses = { "RichEdit20W", "RichEdit20A", "RICHEDIT50W", "RichEditD2DPT", "RichEdit50W" };
@@ -2319,10 +3343,11 @@ namespace ManageNotepadWindows
                 GetClassName(child, cls, cls.Capacity);
                 if (richEditClasses.Contains(cls.ToString()))
                 {
-                    IntPtr result;
-                    SendMessageTimeout(child, WM_SETTEXT, IntPtr.Zero, new StringBuilder(content), SMTO_ABORTIFHUNG, 2000, out result);
-                    setViaChild = true;
-                    return false;
+                    if (TrySetTextViaWin32(child))
+                    {
+                        setViaChild = true;
+                        return false;
+                    }
                 }
                 return true;
             }, IntPtr.Zero);
@@ -2520,6 +3545,10 @@ namespace ManageNotepadWindows
             else if (tabs != null && tabs.SelectedIndex == 3)
             {
                 await PerformHistorySearchAsync();
+            }
+            else if (tabs != null && tabs.SelectedIndex == 4)
+            {
+                await PerformTabStateSearchAsync();
             }
             else
             {
@@ -2795,6 +3824,142 @@ namespace ManageNotepadWindows
             UpdateStatus();
         }
 
+        private async System.Threading.Tasks.Task PerformTabStateSearchAsync()
+        {
+            if (allTabStateFiles.Count == 0 && totalTabStateDirectoryFileCount == 0 && totalTabStatePrimaryFileCount == 0)
+                await System.Threading.Tasks.Task.Run(() => PopulateTabState());
+
+            string searchText = textBoxSearch.Text?.Trim() ?? string.Empty;
+            bool searchContent = chkSearchContent?.Checked ?? false;
+
+            if (string.IsNullOrWhiteSpace(searchText))
+            {
+                tabStateFiles.Clear();
+                tabStateFiles.AddRange(allTabStateFiles);
+                ApplyCurrentTabStateSortIfNeeded();
+                EnsureTabStateSplitterDistance();
+                UpdateStatus();
+                return;
+            }
+
+            var results = await System.Threading.Tasks.Task.Run(() =>
+                allTabStateFiles
+                    .Where(item => MatchesTabStateSearch(item, searchText, searchContent))
+                    .ToList());
+
+            tabStateFiles.Clear();
+            tabStateFiles.AddRange(results);
+            ApplyCurrentTabStateSortIfNeeded();
+            EnsureTabStateSplitterDistance();
+            UpdateStatus();
+        }
+
+        private static bool MatchesTabStateSearch(TabStateInfo item, string searchText, bool searchContent)
+        {
+            if (item == null || string.IsNullOrWhiteSpace(searchText))
+                return false;
+
+            if (ContainsIgnoreCase(item.FileName, searchText) ||
+                ContainsIgnoreCase(item.Preview, searchText))
+            {
+                return true;
+            }
+
+            return searchContent && ContainsIgnoreCase(item.Content, searchText);
+        }
+
+        private static bool ContainsIgnoreCase(string source, string value) =>
+            !string.IsNullOrEmpty(source) &&
+            !string.IsNullOrEmpty(value) &&
+            source.IndexOf(value, StringComparison.OrdinalIgnoreCase) >= 0;
+
+        private void TableTabState_SortRows(object sender, AntdUI.IntEventArgs e)
+        {
+            int columnIndex = e.Value;
+            if (columnIndex < 0 || tableTabState == null || tableTabState.Columns.Count <= columnIndex) return;
+
+            var column = tableTabState.Columns[columnIndex];
+            tabStateSortColumnIndex = columnIndex;
+            tabStateSortAscending = column.SortMode == AntdUI.SortMode.ASC;
+
+            TabStateInfo selectedItem = selectedTabStateIndex >= 0 && selectedTabStateIndex < tabStateFiles.Count
+                ? tabStateFiles[selectedTabStateIndex]
+                : null;
+
+            SortTabStateByColumn(columnIndex, selectedItem);
+        }
+
+        private void ApplyCurrentTabStateSortIfNeeded(TabStateInfo selectedItem = null)
+        {
+            if (tabStateSortColumnIndex >= 0 && tableTabState != null && tabStateSortColumnIndex < tableTabState.Columns.Count)
+            {
+                var column = tableTabState.Columns[tabStateSortColumnIndex];
+                column.SortMode = tabStateSortAscending ? AntdUI.SortMode.ASC : AntdUI.SortMode.DESC;
+                SortTabStateByColumn(tabStateSortColumnIndex, selectedItem);
+                return;
+            }
+
+            RefreshTabStateTable();
+            ReselectTabStateItem(selectedItem);
+        }
+
+        private void SortTabStateByColumn(int columnIndex, TabStateInfo selectedItem = null)
+        {
+            if (tableTabState == null || columnIndex < 0 || tableTabState.Columns.Count <= columnIndex)
+            {
+                RefreshTabStateTable();
+                ReselectTabStateItem(selectedItem);
+                return;
+            }
+
+            string columnKey = tableTabState.Columns[columnIndex].Key;
+            IEnumerable<TabStateInfo> sorted;
+            switch (columnKey)
+            {
+                case "LastModifiedFormatted":
+                    sorted = tabStateSortAscending
+                        ? tabStateFiles.OrderBy(t => t.LastModified)
+                        : tabStateFiles.OrderByDescending(t => t.LastModified);
+                    break;
+                case "SourceFileDateFormatted":
+                    sorted = tabStateSortAscending
+                        ? tabStateFiles.OrderBy(t => t.SourceFileDate ?? DateTime.MinValue)
+                        : tabStateFiles.OrderByDescending(t => t.SourceFileDate ?? DateTime.MinValue);
+                    break;
+                case "ContentLength":
+                    sorted = tabStateSortAscending
+                        ? tabStateFiles.OrderBy(t => t.ContentLength)
+                        : tabStateFiles.OrderByDescending(t => t.ContentLength);
+                    break;
+                case "Preview":
+                    sorted = tabStateSortAscending
+                        ? tabStateFiles.OrderBy(t => t.Preview ?? string.Empty, StringComparer.CurrentCultureIgnoreCase)
+                        : tabStateFiles.OrderByDescending(t => t.Preview ?? string.Empty, StringComparer.CurrentCultureIgnoreCase);
+                    break;
+                default:
+                    RefreshTabStateTable();
+                    ReselectTabStateItem(selectedItem);
+                    return;
+            }
+
+            tabStateFiles = sorted.ToList();
+            RefreshTabStateTable();
+            ReselectTabStateItem(selectedItem);
+        }
+
+        private void ReselectTabStateItem(TabStateInfo item)
+        {
+            if (item == null || tableTabState == null)
+                return;
+
+            int rowIndex = tabStateFiles.IndexOf(item);
+            if (rowIndex >= 0)
+            {
+                tableTabState.SelectedIndex = rowIndex + 1;
+                SetSelectedTabStateItem(item);
+            }
+        }
+
         private async void btnRefresh_Click(object sender, EventArgs e)
         {
             refresh.Enabled = false;
@@ -2833,9 +3998,16 @@ namespace ManageNotepadWindows
             }
             else if (tabs != null && tabs.SelectedIndex == 4)
             {
-                // Notepad Cache tab - reload from TabState directory
-                await System.Threading.Tasks.Task.Run(() => PopulateTabState());
-                RefreshTabStateTable();
+                // Notepad Cache tab - reload from current source
+                if (customTabStateDir != null)
+                    await System.Threading.Tasks.Task.Run(() => PopulateTabStateFromDirectory(customTabStateDir));
+                else
+                    await System.Threading.Tasks.Task.Run(() => PopulateTabState());
+                if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                    await PerformTabStateSearchAsync();
+                else
+                    ApplyCurrentTabStateSortIfNeeded();
+                EnsureTabStateSplitterDistance();
             }
 
             refresh.Enabled = true;
@@ -2877,6 +4049,7 @@ namespace ManageNotepadWindows
             if (splitContainer1 != null) splitContainer1.SplitterDistance = (int)(splitContainer1.Width * 0.60);
             if (splitContainerBrowser != null) splitContainerBrowser.SplitterDistance = (int)(splitContainerBrowser.Width * 0.60);
             if (splitContainerShells != null) splitContainerShells.SplitterDistance = (int)(splitContainerShells.Width * 0.60);
+            EnsureTabStateSplitterDistance();
 
             // Load saved settings (including sort order)
             LoadSettings();
@@ -2917,6 +4090,7 @@ namespace ManageNotepadWindows
             // Apply saved sort order after data is loaded
             ApplySavedSortOrder();
             UpdateStatus();
+            await PromptToRestoreBackupNotepadContentOnStartupAsync();
         }
 
         private void UpdateStatus(string message = null)
@@ -2957,7 +4131,30 @@ namespace ManageNotepadWindows
             else if (tabs != null && tabs.SelectedIndex == 4)
             {
                 // Notepad Cache tab
-                labelStatus.Text = $"{tabStateFiles.Count} cached Notepad tab{(tabStateFiles.Count != 1 ? "s" : "")} (Win11 TabState)";
+                string cacheCountText = totalTabStateCount > 0 && tabStateFiles.Count != totalTabStateCount
+                    ? $"{tabStateFiles.Count} of {totalTabStateCount} cached Notepad tab{(totalTabStateCount != 1 ? "s" : "")}"
+                    : $"{tabStateFiles.Count} cached Notepad tab{(tabStateFiles.Count != 1 ? "s" : "")}";
+
+                if (totalTabStatePrimaryFileCount > 0)
+                {
+                    labelStatus.Text =
+                        $"{cacheCountText} " +
+                        $"from {totalTabStatePrimaryFileCount} primary TabState file{(totalTabStatePrimaryFileCount != 1 ? "s" : "")}";
+
+                    if (totalTabStateDirectoryFileCount > totalTabStatePrimaryFileCount)
+                    {
+                        labelStatus.Text +=
+                            $" ({totalTabStateDirectoryFileCount} total file{(totalTabStateDirectoryFileCount != 1 ? "s" : "")} in folder)";
+                    }
+                }
+                else if (customTabStateDir != null)
+                {
+                    labelStatus.Text = $"{cacheCountText} from {customTabStateDir}";
+                }
+                else
+                {
+                    labelStatus.Text = $"{cacheCountText} (Win11 TabState)";
+                }
             }
             else
             {
@@ -2971,6 +4168,18 @@ namespace ManageNotepadWindows
 
         private void NotepadsManager_FormClosing(object sender, FormClosingEventArgs e)
         {
+            CancelActiveNotepadRecovery();
+
+            try
+            {
+                BackupUnsavedNotepadContent();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error running final backup: {ex.Message}");
+            }
+
+            SystemEvents.SessionEnding -= OnSessionEnding;
             SaveSettings();
         }
 
@@ -2992,6 +4201,7 @@ namespace ManageNotepadWindows
             this.refresh.Size = new Size((int)(150 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
             this.btnFontIncrease.Size = new Size((int)(130 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
             this.btnFontDecrease.Size = new Size((int)(130 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
+            this.btnToggleTopMost.Size = new Size((int)(130 * dpiScaleFactor), (int)(70 * dpiScaleFactor));
 
             // Scale panel height
             this.panelTop.Height = (int)(70 * dpiScaleFactor);
@@ -3000,6 +4210,43 @@ namespace ManageNotepadWindows
             this.splitContainer1.SplitterWidth = (int)(16 * dpiScaleFactor);
             this.splitContainerBrowser.SplitterWidth = (int)(16 * dpiScaleFactor);
             this.splitContainerShells.SplitterWidth = (int)(16 * dpiScaleFactor);
+            this.splitContainerTabState.SplitterWidth = Math.Max(6, (int)(10 * dpiScaleFactor));
+        }
+
+        private void EnsureTabStateSplitterDistance()
+        {
+            if (splitContainerTabState == null) return;
+
+            if (tabStatePreviewRight)
+            {
+                if (splitContainerTabState.Width <= 0) return;
+                int minLeft = Math.Max(300, (int)(300 * dpiScaleFactor));
+                int minRight = Math.Max(200, (int)(200 * dpiScaleFactor));
+                splitContainerTabState.Panel1MinSize = minLeft;
+                splitContainerTabState.Panel2MinSize = minRight;
+                int maxLeft = splitContainerTabState.Width - splitContainerTabState.SplitterWidth - minRight;
+                if (maxLeft < minLeft) return;
+                if (splitContainerTabState.SplitterDistance < minLeft || splitContainerTabState.SplitterDistance > maxLeft)
+                {
+                    int preferred = (int)(splitContainerTabState.Width * 0.55);
+                    splitContainerTabState.SplitterDistance = Math.Min(maxLeft, Math.Max(minLeft, preferred));
+                }
+            }
+            else
+            {
+                if (splitContainerTabState.Height <= 0) return;
+                int minTop = Math.Max(200, (int)(220 * dpiScaleFactor));
+                int minBottom = Math.Max(140, (int)(170 * dpiScaleFactor));
+                splitContainerTabState.Panel1MinSize = minTop;
+                splitContainerTabState.Panel2MinSize = minBottom;
+                int maxTop = splitContainerTabState.Height - splitContainerTabState.SplitterWidth - minBottom;
+                if (maxTop < minTop) return;
+                if (splitContainerTabState.SplitterDistance < minTop || splitContainerTabState.SplitterDistance > maxTop)
+                {
+                    int preferred = (int)(splitContainerTabState.Height * 0.58);
+                    splitContainerTabState.SplitterDistance = Math.Min(maxTop, Math.Max(minTop, preferred));
+                }
+            }
         }
 
         private void TableNotepadWindows_SortRows(object sender, AntdUI.IntEventArgs e)
@@ -3338,6 +4585,7 @@ namespace ManageNotepadWindows
             this.refresh = new AntdUI.Button();
             this.btnFontIncrease = new AntdUI.Button();
             this.btnFontDecrease = new AntdUI.Button();
+            this.btnToggleTopMost = new AntdUI.Button();
             this.textBoxSearch = new AntdUI.Input();
             this.chkSearchContent = new AntdUI.Checkbox();
             this.splitContainer1 = new SplitContainer();
@@ -3400,6 +4648,14 @@ namespace ManageNotepadWindows
             this.btnFontDecrease.Radius = 6;
             this.btnFontDecrease.IconSvg = SvgZoomOut;
             this.btnFontDecrease.Click += new EventHandler(this.btnFontDecrease_Click);
+
+            // btnToggleTopMost - pin/unpin always on top
+            this.btnToggleTopMost.Dock = DockStyle.Right;
+            this.btnToggleTopMost.Size = new Size(130, 70);
+            this.btnToggleTopMost.Text = "Pinned";
+            this.btnToggleTopMost.Radius = 6;
+            this.btnToggleTopMost.Type = AntdUI.TTypeMini.Primary;
+            this.btnToggleTopMost.Click += BtnToggleTopMost_Click;
 
             // textBoxSearch - styled input with rounded corners and search icon
             this.textBoxSearch.Dock = DockStyle.Fill;
@@ -3517,10 +4773,13 @@ namespace ManageNotepadWindows
 
             // splitContainerTabState (Notepad Cache tab)
             this.splitContainerTabState.Dock = DockStyle.Fill;
+            this.splitContainerTabState.Size = new Size(850, 437);
             this.splitContainerTabState.Orientation = Orientation.Horizontal;
             this.splitContainerTabState.SplitterDistance = 300;
             this.splitContainerTabState.SplitterWidth = 6;
             this.splitContainerTabState.BorderStyle = BorderStyle.None;
+            this.splitContainerTabState.Panel1MinSize = 220;
+            this.splitContainerTabState.Panel2MinSize = 160;
 
             // textBoxTabStateContent - preview pane
             this.textBoxTabStateContent.Dock = DockStyle.Fill;
@@ -3528,24 +4787,101 @@ namespace ManageNotepadWindows
             this.textBoxTabStateContent.ScrollBars = RichTextBoxScrollBars.Both;
             this.textBoxTabStateContent.BorderStyle = BorderStyle.None;
             this.textBoxTabStateContent.Font = new Font("Consolas", 9f);
-            this.textBoxTabStateContent.WordWrap = false;
+            this.textBoxTabStateContent.WordWrap = true;
             this.textBoxTabStateContent.Text = "Select a tab to preview content. Double-click to open in Notepad.";
 
-            // Restore button below preview
-            var btnRestoreTab = new AntdUI.Button();
-            btnRestoreTab.Dock = DockStyle.Bottom;
-            btnRestoreTab.Height = 36;
-            btnRestoreTab.Text = "Open in Notepad";
-            btnRestoreTab.Type = AntdUI.TTypeMini.Primary;
-            btnRestoreTab.Radius = 6;
-            btnRestoreTab.Click += (s, e) =>
+            var panelTabStatePreview = new AntdUI.Panel();
+            panelTabStatePreview.Dock = DockStyle.Fill;
+            panelTabStatePreview.Shadow = 4;
+            panelTabStatePreview.Radius = 6;
+            panelTabStatePreview.Padding = new Padding(8);
+            panelTabStatePreview.Back = Color.White;
+
+            // Restore buttons below preview
+            var panelTabStateActions = new FlowLayoutPanel();
+            panelTabStateActions.Dock = DockStyle.Bottom;
+            panelTabStateActions.Height = 60;
+            panelTabStateActions.FlowDirection = FlowDirection.LeftToRight;
+            panelTabStateActions.WrapContents = false;
+            panelTabStateActions.Padding = new Padding(14, 10, 0, 0);
+            panelTabStateActions.BackColor = Color.White;
+
+            this.btnRestoreTabState = new AntdUI.Button();
+            this.btnRestoreTabState.Width = 248;
+            this.btnRestoreTabState.Height = 42;
+            this.btnRestoreTabState.Text = "Open in Notepad";
+            this.btnRestoreTabState.Type = AntdUI.TTypeMini.Primary;
+            this.btnRestoreTabState.Radius = 6;
+            this.btnRestoreTabState.Margin = new Padding(0, 0, 10, 0);
+            this.btnRestoreTabState.Click += (s, e) =>
             {
                 if (selectedTabStateIndex >= 0 && selectedTabStateIndex < tabStateFiles.Count)
-                    RestoreTabState(tabStateFiles[selectedTabStateIndex]);
+                    _ = RestoreSingleTabStateAsync(tabStateFiles[selectedTabStateIndex]);
             };
 
-            this.splitContainerTabState.Panel2.Controls.Add(this.textBoxTabStateContent);
-            this.splitContainerTabState.Panel2.Controls.Add(btnRestoreTab);
+            this.btnRestoreAllTabStates = new AntdUI.Button();
+            this.btnRestoreAllTabStates.Width = 220;
+            this.btnRestoreAllTabStates.Height = 42;
+            this.btnRestoreAllTabStates.Text = "Open All...";
+            this.btnRestoreAllTabStates.Radius = 6;
+            this.btnRestoreAllTabStates.Margin = new Padding(0, 0, 10, 0);
+            this.btnRestoreAllTabStates.Click += BtnRestoreAllTabStates_Click;
+
+            this.btnDeleteTabStateCache = new AntdUI.Button();
+            this.btnDeleteTabStateCache.Width = 230;
+            this.btnDeleteTabStateCache.Height = 42;
+            this.btnDeleteTabStateCache.Text = "Delete Cache File";
+            this.btnDeleteTabStateCache.Radius = 6;
+            this.btnDeleteTabStateCache.Margin = new Padding(0, 0, 10, 0);
+            this.btnDeleteTabStateCache.Click += BtnDeleteTabStateCache_Click;
+
+            this.btnBrowseTabStateFolder = new AntdUI.Button();
+            this.btnBrowseTabStateFolder.Width = 340;
+            this.btnBrowseTabStateFolder.Height = 46;
+            this.btnBrowseTabStateFolder.Text = "Browse Folder...";
+            this.btnBrowseTabStateFolder.Radius = 6;
+            this.btnBrowseTabStateFolder.Margin = new Padding(0, 0, 10, 0);
+            this.btnBrowseTabStateFolder.Click += BtnBrowseTabStateFolder_Click;
+
+            this.tabStateRecoveryMenu = new System.Windows.Forms.ContextMenuStrip();
+            this.tabStateRecoveryMenu.Items.Add(new System.Windows.Forms.ToolStripMenuItem(
+                "Open All System Cache Notepads",
+                null,
+                OpenAllSystemCacheNotepadsMenuItem_Click));
+            this.tabStateRecoveryMenu.Items.Add(new System.Windows.Forms.ToolStripMenuItem(
+                "Open All Backup Notepads",
+                null,
+                OpenAllBackupNotepadsMenuItem_Click));
+
+            this.btnCancelTabStateRecovery = new AntdUI.Button();
+            this.btnCancelTabStateRecovery.Width = 172;
+            this.btnCancelTabStateRecovery.Height = 42;
+            this.btnCancelTabStateRecovery.Text = "Cancel";
+            this.btnCancelTabStateRecovery.Radius = 6;
+            this.btnCancelTabStateRecovery.Type = AntdUI.TTypeMini.Error;
+            this.btnCancelTabStateRecovery.Margin = new Padding(0);
+            this.btnCancelTabStateRecovery.Visible = false;
+            this.btnCancelTabStateRecovery.Click += (s, e) => CancelActiveNotepadRecovery();
+
+            this.btnTabStatePreviewLayout = new AntdUI.Button();
+            this.btnTabStatePreviewLayout.Width = 220;
+            this.btnTabStatePreviewLayout.Height = 42;
+            this.btnTabStatePreviewLayout.Text = "Preview Right";
+            this.btnTabStatePreviewLayout.Radius = 6;
+            this.btnTabStatePreviewLayout.Margin = new Padding(0, 0, 10, 0);
+            this.btnTabStatePreviewLayout.Click += BtnTabStatePreviewLayout_Click;
+
+            panelTabStateActions.Controls.Add(this.btnRestoreTabState);
+            panelTabStateActions.Controls.Add(this.btnRestoreAllTabStates);
+            panelTabStateActions.Controls.Add(this.btnDeleteTabStateCache);
+            panelTabStateActions.Controls.Add(this.btnBrowseTabStateFolder);
+            panelTabStateActions.Controls.Add(this.btnTabStatePreviewLayout);
+            panelTabStateActions.Controls.Add(this.btnCancelTabStateRecovery);
+
+            panelTabStatePreview.Controls.Add(this.textBoxTabStateContent);
+            panelTabStatePreview.Controls.Add(panelTabStateActions);
+
+            this.splitContainerTabState.Panel2.Controls.Add(panelTabStatePreview);
 
             // tabs - AntdUI card-style tabs
             this.tabs.Dock = DockStyle.Fill;
@@ -3585,10 +4921,22 @@ namespace ManageNotepadWindows
             this.tabs.SelectedIndexChanged += (s, e) =>
             {
                 UpdateStatus();
-                if (tabs.SelectedIndex == 4 && tabStateFiles.Count == 0)
+                if (tabs.SelectedIndex == 4)
                 {
-                    PopulateTabState();
-                    RefreshTabStateTable();
+                    if (allTabStateFiles.Count == 0)
+                        PopulateTabState();
+
+                    if (!string.IsNullOrWhiteSpace(textBoxSearch.Text))
+                    {
+                        searchDebounceTimer.Stop();
+                        searchDebounceTimer.Start();
+                    }
+                    else
+                    {
+                        ApplyCurrentTabStateSortIfNeeded();
+                    }
+
+                    EnsureTabStateSplitterDistance();
                     UpdateStatus();
                 }
             };
@@ -3602,6 +4950,7 @@ namespace ManageNotepadWindows
             this.panelTop.Back = Color.FromArgb(250, 250, 250);
             this.panelTop.Controls.Add(this.textBoxSearch);
             this.panelTop.Controls.Add(this.chkSearchContent);
+            this.panelTop.Controls.Add(this.btnToggleTopMost);
             this.panelTop.Controls.Add(this.btnFontDecrease);
             this.panelTop.Controls.Add(this.btnFontIncrease);
             this.panelTop.Controls.Add(this.refresh);
@@ -3627,12 +4976,12 @@ namespace ManageNotepadWindows
             this.panelStatus.Padding = new Padding(0);
             this.panelStatus.Controls.Add(this.labelStatus);
 
-            // Form - WinForms docking: last added = first processed
-            // So add Fill first, then edge-docked controls
+            // Form - WinForms docking processes controls in add order for layout,
+            // so add Fill first, then edge-docked controls.
             this.ClientSize = new Size(850, 577);
-            this.Controls.Add(this.tabs);         // Fill - processed last
-            this.Controls.Add(this.panelStatus);  // Bottom - processed second
-            this.Controls.Add(this.panelTop);     // Top - processed first
+            this.Controls.Add(this.tabs);
+            this.Controls.Add(this.panelStatus);
+            this.Controls.Add(this.panelTop);
             this.Text = "Notepad Manager";
             this.BackColor = Color.FromArgb(245, 245, 245);
             this.Load += new EventHandler(this.NotepadsManager_Load);
